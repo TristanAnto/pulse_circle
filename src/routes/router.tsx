@@ -1,13 +1,24 @@
 import { createBrowserRouter } from 'react-router-dom'
 
-import { RoutePlaceholder } from '@/components/feedback/RoutePlaceholder'
-import { paths } from '@/routes/paths'
+import { CheckInPage } from '@/pages/CheckInPage'
+import { DashboardPage } from '@/pages/DashboardPage'
+import { LandingPage } from '@/pages/LandingPage'
+import { MessagesPage } from '@/pages/MessagesPage'
+import { NotFoundPage } from '@/pages/NotFoundPage'
+import { SignInPage } from '@/pages/SignInPage'
+import { AppLayout } from '@/components/layout/AppLayout'
+import { paths, notFoundPath } from '@/routes/paths'
 
 export const router = createBrowserRouter([
-  { path: paths.landing, element: <RoutePlaceholder title="Welcome" /> },
-  { path: paths.signIn, element: <RoutePlaceholder title="Sign in" /> },
-  { path: paths.dashboard, element: <RoutePlaceholder title="Dashboard" /> },
-  { path: paths.checkIn, element: <RoutePlaceholder title="Daily check-in" /> },
-  { path: paths.messages, element: <RoutePlaceholder title="Messages" /> },
-  { path: paths.notFound, element: <RoutePlaceholder title="Page not found" /> },
+  { path: paths.landing, element: <LandingPage /> },
+  { path: paths.signIn, element: <SignInPage /> },
+  {
+    element: <AppLayout />,
+    children: [
+      { path: paths.dashboard, element: <DashboardPage /> },
+      { path: paths.checkIn, element: <CheckInPage /> },
+      { path: paths.messages, element: <MessagesPage /> },
+    ],
+  },
+  { path: notFoundPath, element: <NotFoundPage /> },
 ])

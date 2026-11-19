@@ -4,7 +4,8 @@ export const paths = {
   dashboard: '/dashboard',
   checkIn: '/check-in',
   messages: '/messages',
-  notFound: '*',
 } as const
 
 export type AppPath = (typeof paths)[keyof typeof paths]
+
+export const notFoundPath = '*'
