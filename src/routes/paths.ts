@@ -1,6 +1,7 @@
 export const paths = {
   landing: '/',
   signIn: '/sign-in',
+  register: '/register',
   dashboard: '/dashboard',
   checkIn: '/check-in',
   messages: '/messages',

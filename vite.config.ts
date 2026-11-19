@@ -12,4 +12,15 @@ export default defineConfig({
       '@': fileURLToPath(new URL('./src', import.meta.url)),
     },
   },
+  server: {
+    // Proxy /api to the local Express backend (default PORT 4000) so the
+    // frontend can call /api/auth/* and /api/health during development
+    // without a separate VITE_API_BASE_URL.
+    proxy: {
+      '/api': {
+        target: 'http://localhost:4000',
+        changeOrigin: true,
+      },
+    },
+  },
 })

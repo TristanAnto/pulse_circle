@@ -1,10 +1,28 @@
-import { NavLink } from 'react-router-dom'
+import { NavLink, useNavigate } from 'react-router-dom'
+import { LogOut } from 'lucide-react'
+import { useState } from 'react'
 
 import { cn } from '@/lib/cn'
+import { useAuth } from '@/context/auth'
+import { paths } from '@/routes/paths'
 
 import { navItems } from './navItems'
 
 export function MobileNavigation() {
+  const navigate = useNavigate()
+  const { user, logout } = useAuth()
+  const [isLoggingOut, setIsLoggingOut] = useState(false)
+
+  const handleLogout = async () => {
+    setIsLoggingOut(true)
+    try {
+      await logout()
+    } finally {
+      setIsLoggingOut(false)
+    }
+    navigate(paths.signIn)
+  }
+
   return (
     <nav
       aria-label="Primary"
@@ -29,6 +47,20 @@ export function MobileNavigation() {
             </NavLink>
           </li>
         ))}
+        {user && (
+          <li className="flex-1">
+            <button
+              onClick={handleLogout}
+              disabled={isLoggingOut}
+              className="flex min-h-16 flex-col items-center justify-center gap-1 px-2 py-2 text-sm font-semibold transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+            >
+              <LogOut aria-hidden="true" className="size-6" />
+              <span className="text-[10px]">
+                {isLoggingOut ? 'Signing out…' : 'Sign out'}
+              </span>
+            </button>
+          </li>
+        )}
       </ul>
     </nav>
   )

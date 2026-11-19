@@ -1,5 +1,6 @@
 import { env } from './config/env'
 import { app } from './app'
+import { prisma } from './lib/prisma'
 
 const port = env.port
 
@@ -9,10 +10,23 @@ const server = app.listen(port, () => {
   )
 })
 
-const shutdown = (signal: string) => {
+let shuttingDown = false
+
+const shutdown = async (signal: string) => {
+  if (shuttingDown) {
+    return
+  }
+  shuttingDown = true
+
   console.log(`${signal} received: shutting down Pulse Circle API`)
-  server.close(() => {
+  server.close(async () => {
     console.log('HTTP server closed')
+    try {
+      await prisma.$disconnect()
+      console.log('Prisma client disconnected')
+    } catch (err) {
+      console.error('Error disconnecting Prisma:', err)
+    }
     process.exit(0)
   })
 }

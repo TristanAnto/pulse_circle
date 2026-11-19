@@ -57,6 +57,14 @@ npm run preview
 npm run lint
 ```
 
+### Frontend environment variables
+
+Vite proxies `/api` requests to the local Express backend (default `http://localhost:4000`) during development, so no frontend environment variable is required locally.
+
+If the backend runs on a different host or port, copy `.env.example` to `.env` and set `VITE_API_BASE_URL`. Frontend environment variables are embedded in the browser bundle — never store backend secrets, database credentials, or JWT secrets in them.
+
+For production, the preferred arrangement is same-origin serving or a reverse proxy so the frontend and API share an origin (which keeps cookies and CSRF working). Cross-site frontend/backend deployments require additional cookie (`SameSite=None; Secure`) and CSRF configuration.
+
 ## Backend setup
 
 ```bash

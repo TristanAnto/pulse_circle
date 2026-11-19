@@ -1,16 +1,33 @@
-import { Link, useLocation } from 'react-router-dom'
+import { Link, useLocation, useNavigate } from 'react-router-dom'
+import { LogOut } from 'lucide-react'
+import { useState } from 'react'
 
 import { Avatar } from '@/components/ui/Avatar'
 import { BrandMark } from '@/components/ui/BrandMark'
+import { Button } from '@/components/ui/Button'
 import { StatusBadge } from '@/components/ui/StatusBadge'
-import { demoUser } from '@/data/mockData'
+import { useAuth } from '@/context/auth'
 import { paths } from '@/routes/paths'
 
 import { pageTitles } from './navItems'
 
 export function Header() {
   const { pathname } = useLocation()
+  const navigate = useNavigate()
+  const { user, logout, loading } = useAuth()
+  const [isLoggingOut, setIsLoggingOut] = useState(false)
+
   const title = pageTitles[pathname] ?? 'Pulse Circle'
+
+  const handleLogout = async () => {
+    setIsLoggingOut(true)
+    try {
+      await logout()
+    } finally {
+      setIsLoggingOut(false)
+    }
+    navigate(paths.signIn)
+  }
 
   return (
     <header className="sticky top-0 z-30 border-b border-line bg-canvas/95 backdrop-blur">
@@ -28,12 +45,23 @@ export function Header() {
           <StatusBadge tone="attention" className="hidden sm:inline-flex">
             Demo data
           </StatusBadge>
-          <div className="flex items-center gap-2">
-            <Avatar name={demoUser.name} size="sm" />
-            <span className="hidden text-sm font-semibold sm:inline">
-              {demoUser.firstName}
-            </span>
-          </div>
+          {user && (
+            <div className="flex items-center gap-2">
+              <Avatar name={user.fullName} size="sm" />
+              <span className="hidden text-sm font-semibold sm:inline">
+                {user.fullName}
+              </span>
+              <Button
+                onClick={handleLogout}
+                size="sm"
+                disabled={isLoggingOut || loading}
+                className="hidden sm:flex"
+              >
+                {isLoggingOut ? 'Signing out…' : 'Sign out'}
+                <LogOut aria-hidden="true" className="ml-2 size-4" />
+              </Button>
+            </div>
+          )}
         </div>
       </div>
     </header>

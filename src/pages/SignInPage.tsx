@@ -1,22 +1,69 @@
-import { ChevronRight, Eye, EyeOff, Info } from 'lucide-react'
-import { Link } from 'react-router-dom'
+import { ChevronRight, Eye, EyeOff } from 'lucide-react'
+import { Link, useLocation, useNavigate } from 'react-router-dom'
 
 import { BrandMark } from '@/components/ui/BrandMark'
 import { Button } from '@/components/ui/Button'
 import { Card } from '@/components/ui/Card'
+import { StatusBadge } from '@/components/ui/StatusBadge'
+import { useAuth } from '@/context/auth'
 import { paths } from '@/routes/paths'
 
 import React from 'react'
 
 export function SignInPage() {
   const [showPassword, setShowPassword] = React.useState(false)
-  const [notice, setNotice] = React.useState<{ text: string } | null>(null)
+  const [error, setError] = React.useState<string | null>(null)
+  const [isSubmitting, setIsSubmitting] = React.useState(false)
+  const { login, user, loading } = useAuth()
+  const navigate = useNavigate()
+  const location = useLocation()
 
-  const handleSubmit = (event: React.FormEvent<HTMLFormElement>) => {
+  const redirectTo: string | null = (() => {
+    const from = location.state?.from
+    if (!from) {
+      return null
+    }
+    const target =
+      typeof from === 'string' ? from : from.pathname ?? '/'
+    const search = typeof from !== 'string' ? from.search ?? '' : ''
+    const hash = typeof from !== 'string' ? from.hash ?? '' : ''
+    // Only allow internal, same-origin paths (no protocol/host).
+    if (!target.startsWith('/') || target.includes('://')) {
+      return null
+    }
+    return `${target}${search}${hash}`
+  })()
+
+  React.useEffect(() => {
+    if (!loading && user) {
+      navigate(redirectTo ?? paths.dashboard, { replace: true })
+    }
+  }, [loading, user, navigate, redirectTo])
+
+  const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
-    setNotice({
-      text: 'Demonstration only: authentication is not connected. Entering email and password will not sign you in anywhere.',
-    })
+    setError(null)
+    setIsSubmitting(true)
+
+    const form = event.currentTarget
+    const formData = new FormData(form)
+    const email = (formData.get('email') ?? '').toString().trim().toLowerCase()
+    const password = (formData.get('password') ?? '').toString()
+
+    if (!email || !password) {
+      setError('Please enter your email address and password.')
+      setIsSubmitting(false)
+      return
+    }
+
+    try {
+      await login({ email, password })
+      // Redirect to dashboard is handled by the useEffect above once `user` is set.
+    } catch (err) {
+      setError((err as Error).message ?? 'Login failed. Please try again.')
+    } finally {
+      setIsSubmitting(false)
+    }
   }
 
   return (
@@ -107,17 +154,28 @@ export function SignInPage() {
                 </label>
               </div>
 
+              {error ? (
+                <div className="mb-2">
+                  <StatusBadge tone="danger">{error}</StatusBadge>
+                </div>
+              ) : null}
+
               <p className="text-right">
                 <Link
-                  to={paths.landing}
+                  to={paths.signIn}
                   className="text-sm font-semibold text-pulse-800 hover:underline"
                 >
                   Forgot password?
                 </Link>
               </p>
 
-              <Button type="submit" size="lg" className="w-full">
-                Sign in
+              <Button
+                type="submit"
+                size="lg"
+                className="w-full"
+                disabled={isSubmitting}
+              >
+                {isSubmitting ? 'Signing in…' : 'Sign in'}
                 <ChevronRight aria-hidden="true" className="size-5" />
               </Button>
             </form>
@@ -125,27 +183,18 @@ export function SignInPage() {
             <p className="mt-8 text-center text-sm text-ink-muted">
               Don’t have an account yet?{' '}
               <Link
-                to={paths.landing}
+                to={paths.register}
                 className="font-semibold text-pulse-800 underline underline-offset-2 hover:text-pulse-900"
               >
-                Start here
+                Create an account
               </Link>
             </p>
-          </div>
 
-          {notice ? (
-            <div className="border-t border-line bg-surface-muted px-6 py-4 sm:px-8">
-              <p className="flex items-center gap-2 text-sm text-pulse-800">
-                <Info aria-hidden="true" className="size-5" />
-                <span>{notice.text}</span>
+            <div className="border-t border-line bg-surface-muted px-6 py-4 text-center sm:px-8">
+              <p className="text-sm text-ink-muted">
+                Demonstration only — accounts are created against the backend API.
               </p>
             </div>
-          ) : null}
-
-          <div className="border-t border-line bg-surface-muted px-6 py-4 text-center sm:px-8">
-            <p className="text-sm text-ink-muted">
-              Demonstration only — no real account is created and nothing is sent to a server.
-            </p>
           </div>
         </Card>
       </main>
