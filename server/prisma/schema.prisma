@@ -1,0 +1,210 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Pulse Circle data model.
+//
+// ID strategy: every model uses a UUID primary key with Prisma's
+// `@default(uuid())`. Application code never generates raw IDs.
+//
+// Deletion policy: check-in and escalation history is preserved. Users and
+// circles are protected from deletion when dependent history exists
+// (`onDelete: Restrict`). Memberships and schedules belong to their owner
+// and cascade. A deleted circle nullifies `circleId` on notifications
+// (`onDelete: SetNull`) because that column is optional.
+
+enum MemberRole {
+  ELDER
+  NEIGHBOR
+  FAMILY
+  EMERGENCY_CONTACT
+  ADMIN
+}
+
+enum CheckInStatus {
+  PENDING
+  COMPLETED
+  MISSED
+  SKIPPED
+}
+
+enum EscalationStatus {
+  PENDING
+  ACTIVE
+  ACKNOWLEDGED
+  CANCELLED
+  RESOLVED
+}
+
+// Business rule: acknowledging an escalation does NOT mean the elderly
+// person is safe. This enum only tracks event flow; safety confirmation is
+// a separate concern outside the scope of this schema.
+enum EscalationEventType {
+  CHECK_IN_REMINDER
+  CHECK_IN_MISSED
+  ESCALATION_STARTED
+  ESCALATION_ACKNOWLEDGED
+  NEIGHBOR_NOTIFIED
+  FAMILY_NOTIFIED
+}
+
+enum NotificationType {
+  CHECK_IN_REMINDER
+  CHECK_IN_MISSED
+  ESCALATION_STARTED
+  ESCALATION_ACKNOWLEDGED
+  ALERT
+  GENERAL
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  DELIVERED
+  FAILED
+  READ
+}
+
+model User {
+  id            String      @id @default(uuid())
+  fullName      String
+  email         String      @unique
+  passwordHash  String?
+  phoneNumber   String?
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  circles       CircleMember[]
+  checkIns      CheckIn[]
+  notifications Notification[]
+  receivedEvents EscalationEvent[] @relation("EscalationEventRecipient")
+
+  @@index([createdAt])
+}
+
+model Circle {
+  id          String   @id @default(uuid())
+  name        String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  members     CircleMember[]
+  schedules   CheckInSchedule[]
+  checkIns    CheckIn[]
+  notifications Notification[]
+
+  @@index([createdAt])
+}
+
+model CircleMember {
+  id        String      @id @default(uuid())
+  userId    String
+  circleId  String
+  role      MemberRole
+  joinedAt  DateTime    @default(now())
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  circle  Circle   @relation(fields: [circleId], references: [id], onDelete: Cascade)
+
+  // One user can belong to a given circle only once.
+  @@unique([userId, circleId])
+  @@index([userId])
+  @@index([circleId])
+}
+
+model CheckInSchedule {
+  id          String   @id @default(uuid())
+  circleId    String
+  // "HH:MM" local time of day (PostgreSQL has no standalone time type in
+  // Prisma; stored as text and validated by the application layer).
+  scheduledTime String
+  timezone    String   @default("UTC")
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  circle    Circle @relation(fields: [circleId], references: [id], onDelete: Cascade)
+
+  @@index([circleId])
+  @@index([isActive])
+}
+
+model CheckIn {
+  id          String          @id @default(uuid())
+  userId      String
+  circleId    String
+  status      CheckInStatus   @default(PENDING)
+  checkedInAt DateTime?
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Restrict)
+  circle    Circle   @relation(fields: [circleId], references: [id], onDelete: Restrict)
+  escalation Escalation?
+
+  // Ready for future missed-check-in tracking: query by circle + status +
+  // createdAt is the common lookup pattern for escalation workers.
+  @@index([circleId])
+  @@index([userId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model Escalation {
+  id          String           @id @default(uuid())
+  checkInId   String           @unique
+  status      EscalationStatus @default(PENDING)
+  currentLevel Int             @default(1)
+  startedAt   DateTime         @default(now())
+  resolvedAt  DateTime?
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  checkIn   CheckIn @relation(fields: [checkInId], references: [id], onDelete: Restrict)
+  events    EscalationEvent[]
+
+  @@index([status])
+  @@index([createdAt])
+}
+
+model EscalationEvent {
+  id          String                @id @default(uuid())
+  escalationId String
+  recipientId  String
+  level        Int
+  eventType    EscalationEventType
+  createdAt    DateTime @default(now())
+
+  escalation Escalation @relation(fields: [escalationId], references: [id], onDelete: Cascade)
+  recipient  User     @relation("EscalationEventRecipient", fields: [recipientId], references: [id], onDelete: Restrict)
+
+  @@index([escalationId])
+  @@index([recipientId])
+  @@index([createdAt])
+}
+
+model Notification {
+  id          String              @id @default(uuid())
+  userId      String
+  circleId    String?
+  type        NotificationType
+  title       String
+  message     String
+  status      NotificationStatus  @default(PENDING)
+  readAt      DateTime?
+  createdAt   DateTime            @default(now())
+
+  user    User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  circle  Circle? @relation(fields: [circleId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([circleId])
+  @@index([status])
+  @@index([createdAt])
+}

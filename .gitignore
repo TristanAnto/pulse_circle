@@ -26,6 +26,10 @@ dist-ssr
 # Pulse Circle project exclusions
 .env*
 !.env.example
+!server/.env.example
 _starter-backup/
 pulse_circle_remote_inspect/
 .dist/
+
+# Backend server build output
+server/dist/
