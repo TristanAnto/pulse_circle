@@ -4,6 +4,7 @@ import cors from 'cors'
 import { env } from './config/env'
 import { router as healthRouter } from './routes/health'
 import { router as authRouter } from './routes/auth'
+import { router as circlesRouter } from './routes/circles'
 import { notFound } from './middleware/notFound'
 import { errorHandler } from './middleware/errorHandler'
 
@@ -19,6 +20,7 @@ app.use(
 )
 
 app.use('/api/auth', authRouter)
+app.use('/api/circles', circlesRouter)
 app.use('/api/health', healthRouter)
 
 app.use(notFound)

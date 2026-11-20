@@ -70,6 +70,14 @@ enum NotificationStatus {
   READ
 }
 
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  EXPIRED
+  CANCELLED
+}
+
 model User {
   id            String      @id @default(uuid())
   fullName      String
@@ -83,6 +91,8 @@ model User {
   checkIns      CheckIn[]
   notifications Notification[]
   receivedEvents EscalationEvent[] @relation("EscalationEventRecipient")
+  invitationsSent   CircleInvitation[] @relation("CircleInvitationInviter")
+  invitationsReceived CircleInvitation[] @relation("CircleInvitationInvitee")
 
   @@index([createdAt])
 }
@@ -98,6 +108,7 @@ model Circle {
   schedules   CheckInSchedule[]
   checkIns    CheckIn[]
   notifications Notification[]
+  invitations CircleInvitation[]
 
   @@index([createdAt])
 }
@@ -207,4 +218,28 @@ model Notification {
   @@index([circleId])
   @@index([status])
   @@index([createdAt])
+}
+
+model CircleInvitation {
+  id          String      @id @default(uuid())
+  circleId    String
+  inviterId   String?
+  inviteeEmail String
+  inviteeId   String?
+  role        MemberRole    @default(NEIGHBOR)
+  status      InvitationStatus @default(PENDING)
+  tokenHash   String        @unique
+  expiresAt   DateTime
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  acceptedAt  DateTime?
+
+  circle    Circle   @relation(fields: [circleId], references: [id], onDelete: Restrict)
+  inviter   User?    @relation("CircleInvitationInviter", fields: [inviterId], references: [id], onDelete: SetNull)
+  invitee   User?    @relation("CircleInvitationInvitee", fields: [inviteeId], references: [id], onDelete: SetNull)
+
+  @@index([circleId])
+  @@index([inviterId])
+  @@index([inviteeEmail])
+  @@index([expiresAt])
 }
