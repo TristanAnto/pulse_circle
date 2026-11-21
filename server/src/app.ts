@@ -5,6 +5,7 @@ import { env } from './config/env'
 import { router as healthRouter } from './routes/health'
 import { router as authRouter } from './routes/auth'
 import { router as circlesRouter } from './routes/circles'
+import { router as invitationsRouter } from './routes/invitations'
 import { notFound } from './middleware/notFound'
 import { errorHandler } from './middleware/errorHandler'
 
@@ -21,6 +22,7 @@ app.use(
 
 app.use('/api/auth', authRouter)
 app.use('/api/circles', circlesRouter)
+app.use('/api/invitations', invitationsRouter)
 app.use('/api/health', healthRouter)
 
 app.use(notFound)

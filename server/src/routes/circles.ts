@@ -9,8 +9,19 @@ import { prisma } from '../lib/prisma'
 import { toNexconnUserId } from '../lib/nexconn'
 import {
   createNexconnGroup,
+  addNexconnGroupMembers,
+  listAllNexconnGroupMembers,
+  listNexconnGroupMembers,
+  sendNexconnGroupMessage,
   toNexconnGroupId,
 } from '../lib/nexconnGroup'
+import {
+  createSyncLeaseOwnerToken,
+  acquireCircleNexconnSyncLease,
+  renewCircleNexconnSyncLease,
+  assertCircleNexconnSyncLeaseHeld,
+  releaseCircleNexconnSyncLease,
+} from '../lib/circleNexconnSyncLease'
 import { InvitationStatus, MemberRole, Prisma } from '@prisma/client'
 import { generateInvitationToken, hashInvitationToken } from '../lib/invitation'
 import { sendInvitationEmail } from '../lib/email'
@@ -41,6 +52,10 @@ const createInvitationSchema = z.object({
 
 const acceptInvitationSchema = z.object({
   token: z.string().length(64).regex(/^[0-9a-fA-F]{64}$/),
+})
+
+const sendNexconnMessageSchema = z.object({
+  text: z.string().trim().min(1).max(2000),
 })
 
 
@@ -97,6 +112,22 @@ type NexconnChannelResponse = {
   circleId: string
   groupId: string
   status: 'CREATED' | 'PENDING' | 'FAILED'
+}
+
+/**
+ * Response for the Nexconn group-channel synchronization endpoint.
+ *
+ * Extends the channel response with membership sync statistics.
+ * `status` values are response-only and are NOT part of the database enum.
+ */
+type NexconnChannelSyncResponse = {
+  circleId: string
+  groupId: string
+  status: 'CREATED' | 'SYNCED' | 'PARTIAL' | 'FAILED'
+  membersSynced: number
+  membersRemaining: number
+  complete: boolean
+  nexconnError?: string
 }
 
 /**
@@ -459,6 +490,21 @@ router.post(
       }
     }
 
+    // Prevent duplicate active invitations to the same email for this circle.
+    const now = new Date()
+    const existingPending = await prisma.circleInvitation.findFirst({
+      where: {
+        circleId,
+        inviteeEmail: normalizedEmail,
+        status: InvitationStatus.PENDING,
+        expiresAt: { gt: now },
+      },
+    })
+    if (existingPending) {
+      res.status(409).json({ error: 'A pending invitation already exists for this email' })
+      return
+    }
+
     // Generate token and hash
     const rawToken = generateInvitationToken()
     const tokenHash = hashInvitationToken(rawToken)
@@ -497,7 +543,6 @@ router.post(
         select: {
           id: true,
           circleId: true,
-          userId: true,
           role: true,
           status: true,
           expiresAt: true,
@@ -515,7 +560,8 @@ router.post(
       return
     }
 
-    // Send invitation email
+    // Send invitation email (optional — delivery is not required for
+    // in-app acceptance when the invitee is already registered).
     const emailResult = await sendInvitationEmail({
       to: normalizedEmail,
       circleName: circle.name,
@@ -524,8 +570,16 @@ router.post(
       expiresAt,
     })
 
-    // Handle email delivery result
-    if (emailResult.status !== 'sent') {
+    let deliveryStatus = 'not_sent'
+    if (emailResult.status === 'sent') {
+      deliveryStatus = 'accepted_by_provider'
+    }
+
+    // If email delivery failed and the invitee is not a registered user,
+    // cancel the invitation since there is no in-app acceptance path for
+    // them. If the invitee is registered, keep the invitation PENDING so
+    // they can accept it inside Pulse Circle.
+    if (emailResult.status !== 'sent' && !existingUser) {
       // Cancel the invitation only if it is still pending
       try {
         const cancellation = await prisma.circleInvitation.updateMany({
@@ -539,16 +593,11 @@ router.post(
         })
 
         if (cancellation.count === 0) {
-          // Invitation is no longer PENDING (e.g., already accepted or
-          // cancelled); do not treat this as a cancellation failure.
           console.log(
             `Invitation ${invitation.id} could not be cancelled: status is no longer PENDING`,
           )
         }
       } catch (err) {
-        // Cancellation itself failed; log a safe diagnostic and continue with
-        // the delivery error response. Do not expose cancellation errors to
-        // the client.
         console.log(
           `Invitation ${invitation.id} cancellation failed: ${err instanceof Prisma.PrismaClientKnownRequestError ? err.code : 'unknown error'}`,
         )
@@ -571,7 +620,7 @@ router.post(
         status: 'PENDING',
         expiresAt,
       },
-      delivery: 'accepted_by_provider',
+      delivery: deliveryStatus,
     })
   }
 )
@@ -647,6 +696,16 @@ router.post(
 
     try {
       await prisma.$transaction(async (tx) => {
+        // Lock the Circle row before any membership mutation to serialize
+        // with concurrent member removals.
+        const circleRows = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+          `SELECT id FROM "Circle" WHERE id = $1 FOR UPDATE`,
+          invitation.circleId
+        )
+        if (circleRows.length === 0) {
+          throw new Error('Circle not found')
+        }
+
         const updated = await tx.circleInvitation.updateMany({
           where: {
             id: invitation.id,
@@ -857,11 +916,96 @@ router.get(
 )
 
 /**
+ * POST /api/circles/:circleId/nexconn-channel/sync-member
+ * Synchronizes the authenticated caller's own Nexconn identity into the
+ * existing CREATED Nexconn group channel for this Circle.
+ *
+ * Requires authentication and active Circle membership. Only the caller's
+ * own Nexconn user ID is synced — no target user ID is accepted from the
+ * client. Does not create a new channel or modify CircleMember records.
+ * Provider code 25412 (already a member) is treated as success.
+ */
+router.post(
+  '/:circleId/nexconn-channel/sync-member',
+  authenticate,
+  membershipRequired('circleId'),
+  csrfProtection,
+  async (
+    req: CircleMembershipRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    if (!req.circleMembership) {
+      res.status(403).json({ error: 'Membership required' })
+      return
+    }
+
+    const circleId = req.circleMembership.circleId
+    const userId = req.circleMembership.userId
+
+    try {
+      const channel = await prisma.circleNexconnChannel.findUnique({
+        where: { circleId },
+        select: {
+          circleId: true,
+          groupId: true,
+          creationStatus: true,
+        },
+      })
+
+      if (!channel) {
+        res.status(404).json({ error: 'Nexconn channel not created for this circle' })
+        return
+      }
+
+      if (channel.creationStatus !== 'CREATED' || !channel.groupId) {
+        res.status(400).json({ error: 'Nexconn channel is not ready for member sync' })
+        return
+      }
+
+      const nexconnUserId = toNexconnUserId(userId)
+      const syncResult = await addNexconnGroupMembers({
+        channelId: channel.groupId,
+        userIds: [nexconnUserId],
+      })
+
+      if (!syncResult.ok) {
+        const alreadyMember =
+          typeof syncResult.code === 'number' && syncResult.code === 25412
+        if (alreadyMember) {
+          res.status(200).json({
+            circleId,
+            groupId: channel.groupId,
+            nexconnSync: 'already-member',
+          })
+          return
+        }
+        res.status(502).json({
+          error: 'Nexconn member sync failed.',
+          nexconnSync: false,
+          nexconnCode: syncResult.code,
+        })
+        return
+      }
+
+      res.status(200).json({
+        circleId,
+        groupId: channel.groupId,
+        nexconnSync: 'added',
+      })
+    } catch (err) {
+      next(err)
+    }
+  }
+)
+
+/**
  * POST /api/circles/:circleId/nexconn-channel
  * Creates the Nexconn group channel for a Pulse Circle, if one does not
- * already exist.
+ * already exist, then synchronizes all Pulse Circle members into the group.
  *
- * Uses a database claim so concurrent callers cannot create duplicate groups.
+ * Uses a per-circle database lease so concurrent callers cannot create
+ * duplicate groups or run conflicting synchronization operations.
  * An uncertain Nexconn response (timeout, unknown outcome) is recorded as
  * PENDING and never triggers automatic recreation; only a clearly failed
  * response is marked FAILED and made retryable.
@@ -884,180 +1028,480 @@ router.post(
     const circleId = req.circleMembership.circleId
     const userId = req.circleMembership.userId
     const groupId = toNexconnGroupId(circleId)
+    const ownerToken = createSyncLeaseOwnerToken()
+    const ttlMs = 60_000
 
-    let claimed: { claimed: boolean; existing: { groupId: string; creationStatus: string } | null }
+    let leaseHeld = false
+
     try {
-      // Claim the row first, inside a transaction, so two simultaneous
-      // requests cannot both proceed to create an external group.
-      claimed = await prisma.$transaction(async (tx) => {
-        const existing = await tx.circleNexconnChannel.findUnique({
-          where: { circleId },
-          select: { groupId: true, creationStatus: true },
-        })
-
-        if (existing) {
-          return { claimed: false, existing }
+      // Step 1: Lock the Circle row, then insert or preserve the placeholder
+      // mapping inside a short transaction. The Circle lock serializes
+      // placeholder creation with the future member-removal no-channel path.
+      const channel = await prisma.$transaction(async (tx) => {
+        const circleRows = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+          `SELECT id FROM "Circle" WHERE id = $1 FOR UPDATE`,
+          circleId
+        )
+        if (circleRows.length === 0) {
+          throw new Error('Circle not found')
         }
 
-        await tx.circleNexconnChannel.create({
-          data: {
-            circleId,
-            groupId,
-            ownerUserId: userId,
-            creationStatus: 'PENDING',
+        // Revalidate authorization: the calling user must be a member of
+        // this circle (already enforced by membershipRequired middleware;
+        // re-check under the lock for defense in depth).
+        const membership = await tx.circleMember.findUnique({
+          where: {
+            userId_circleId: {
+              userId: req.circleMembership!.userId,
+              circleId,
+            },
           },
-          select: { circleId: true, groupId: true, creationStatus: true },
+          select: { circleId: true, userId: true, role: true },
         })
+        if (!membership) {
+          throw new Error('Membership required')
+        }
 
-        return { claimed: true, existing: null }
-      })
-    } catch (err) {
-      // P2002: another concurrent request claimed the row first. Re-read the
-      // mapping and return it or 409 instead of surfacing a raw Prisma error.
-      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
-        const current = await prisma.circleNexconnChannel.findUnique({
+        // Insert placeholder if absent; preserve any existing mapping.
+        await tx.$executeRawUnsafe(
+          `INSERT INTO "CircleNexconnChannel" ("circleId", "groupId", "ownerUserId", "creationStatus", "updatedAt")
+           VALUES ($1, $2, $3, 'PENDING', clock_timestamp())
+           ON CONFLICT ("circleId") DO NOTHING`,
+          circleId, groupId, userId
+        )
+
+        // Read and return the channel mapping (existing or newly created).
+        return await tx.circleNexconnChannel.findUnique({
           where: { circleId },
-          select: { circleId: true, groupId: true, creationStatus: true },
+          select: {
+            circleId: true,
+            groupId: true,
+            ownerUserId: true,
+            creationStatus: true,
+          },
         })
-        if (!current) {
-          next(err)
-          return
-        }
-        if (current.creationStatus === 'CREATED') {
-          const response: NexconnChannelResponse = {
-            circleId: current.circleId,
-            groupId: current.groupId,
-            status: 'CREATED',
-          }
-          res.json(response)
-          return
-        }
+      })
+
+      if (!channel) {
+        res.status(500).json({ error: 'Channel mapping not found' })
+        return
+      }
+
+      // Step 2: Acquire the per-circle lease. No Nexconn request is made
+      // unless the lease is held.
+      leaseHeld = await acquireCircleNexconnSyncLease(circleId, ownerToken, ttlMs)
+      if (!leaseHeld) {
         res.status(409).json({
-          error: 'Channel creation already in progress',
-          groupId: current.groupId,
+          error: 'Operation already in progress for this circle',
+          groupId,
         })
         return
       }
+
+      // The stored ownerUserId is the source of truth for the Nexconn owner.
+      // It is initialized once on placeholder creation and never overwritten.
+      const storedOwnerNexconnId = toNexconnUserId(channel.ownerUserId)
+
+      // Step 4: Handle PENDING or FAILED rows — recovery check.
+      // Verify whether an earlier uncertain creation actually succeeded
+      // before deciding to create or retry.
+      if (channel.creationStatus === 'PENDING' || channel.creationStatus === 'FAILED') {
+        await assertCircleNexconnSyncLeaseHeld(circleId, ownerToken)
+        await renewCircleNexconnSyncLease(circleId, ownerToken, ttlMs)
+
+        const existenceCheck = await listNexconnGroupMembers({ channelId: groupId })
+
+        if (existenceCheck.ok) {
+          // Group exists externally — mark CREATED and proceed to sync.
+          await updateCircleNexconnChannelFenced(circleId, ownerToken, 'CREATED', null)
+        } else if (existenceCheck.code === 25410) {
+          // Group does not exist externally — proceed to creation below.
+        } else {
+          // Uncertain outcome — preserve state, return retryable response.
+          res.status(503).json({
+            circleId,
+            groupId,
+            status: channel.creationStatus === 'FAILED' ? 'FAILED' : 'PENDING',
+            membersSynced: 0,
+            membersRemaining: 0,
+            complete: false,
+            nexconnError: `Unable to verify channel state (code ${existenceCheck.code})`,
+          })
+          return
+        }
+      }
+
+      // Step 5: Create the group if not yet CREATED.
+      // Re-read the row because recovery may have marked it CREATED.
+      const currentChannel = await prisma.circleNexconnChannel.findUnique({
+        where: { circleId },
+        select: { creationStatus: true },
+      })
+
+      if (currentChannel?.creationStatus !== 'CREATED') {
+        await assertCircleNexconnSyncLeaseHeld(circleId, ownerToken)
+        await renewCircleNexconnSyncLease(circleId, ownerToken, ttlMs)
+
+        // Fetch Pulse Circle members for the creation invite list.
+        // Pulse Circle remains the source of truth for membership.
+        const members = await prisma.circleMember.findMany({
+          where: { circleId },
+          select: { userId: true },
+          orderBy: { joinedAt: 'asc' },
+        })
+        const memberIds = members.map((m) => toNexconnUserId(m.userId))
+        const inviteeIds = memberIds.filter((id) => id !== storedOwnerNexconnId).slice(0, 30)
+
+        const createResult = await createNexconnGroup({
+          channelId: groupId,
+          name: `Pulse Circle ${circleId}`,
+          owner: storedOwnerNexconnId,
+          userIds: inviteeIds,
+        })
+
+        if (createResult.ok) {
+          await updateCircleNexconnChannelFenced(circleId, ownerToken, 'CREATED', null)
+        } else if (createResult.code === 25409) {
+          // Duplicate group — external group already exists. Mark CREATED.
+          await updateCircleNexconnChannelFenced(circleId, ownerToken, 'CREATED', null)
+        } else {
+          // Clearly failed response — safe to retry later.
+          await updateCircleNexconnChannelFenced(
+            circleId,
+            ownerToken,
+            'FAILED',
+            `Nexconn code ${createResult.code}`
+          )
+          res.status(502).json({
+            circleId,
+            groupId,
+            status: 'FAILED',
+            membersSynced: 0,
+            membersRemaining: 0,
+            complete: false,
+            nexconnError: `Nexconn code ${createResult.code}`,
+          })
+          return
+        }
+      }
+
+      // Step 6: Batch member synchronization.
+      const syncResult = await syncNexconnMembers(
+        circleId,
+        groupId,
+        storedOwnerNexconnId,
+        ownerToken,
+        ttlMs,
+      )
+
+      const response: NexconnChannelSyncResponse = {
+        circleId,
+        groupId,
+        status: syncResult.complete ? 'SYNCED' : 'PARTIAL',
+        membersSynced: syncResult.membersSynced,
+        membersRemaining: syncResult.membersRemaining,
+        complete: syncResult.complete,
+        ...(syncResult.nexconnError ? { nexconnError: syncResult.nexconnError } : {}),
+      }
+
+      res.status(200).json(response)
+      return
+
+    } catch (err) {
       next(err)
+    } finally {
+      if (leaseHeld) {
+        try {
+          await releaseCircleNexconnSyncLease(circleId, ownerToken)
+        } catch {
+          // Release failure is non-fatal; the lease expires via TTL.
+        }
+      }
+    }
+  }
+)
+
+/**
+ * POST /api/circles/:circleId/nexconn-messages
+ * Sends a text message to the Nexconn group channel mapped to a Pulse Circle.
+ *
+ * Requires authentication, active membership, and a valid CSRF token. The
+ * caller must be a member of the circle and the circle must have a Nexconn
+ * channel mapping in CREATED state (created via
+ * POST /api/circles/:circleId/nexconn-channel).
+ */
+router.post(
+  '/:circleId/nexconn-messages',
+  authenticate,
+  csrfProtection,
+  membershipRequired('circleId'),
+  async (
+    req: CircleMembershipRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    if (!req.circleMembership) {
+      res.status(403).json({ error: 'Membership required' })
       return
     }
 
+    const result = sendNexconnMessageSchema.safeParse(req.body)
+    if (!result.success) {
+      res.status(400).json({ error: 'Invalid input' })
+      return
+    }
+
+    const circleId = req.circleMembership.circleId
+    const userId = req.circleMembership.userId
+    const { text } = result.data
+
     try {
-      // claimed.existing is set when a row already existed; null means we just
-      // claimed a fresh PENDING row and should proceed to create the group.
-      if (claimed.existing) {
-        const existing = claimed.existing
-        if (existing.creationStatus === 'CREATED') {
-          const response: NexconnChannelResponse = {
-            circleId: req.params.circleId,
-            groupId: existing.groupId,
-            status: 'CREATED',
-          }
-          res.json(response)
-          return
-        }
-
-        if (existing.creationStatus === 'PENDING') {
-          res.status(409).json({
-            error: 'Channel creation already in progress',
-            groupId,
-          })
-          return
-        }
-
-        // FAILED: a prior attempt clearly failed, so this is safe to retry.
-        // Flip back to PENDING inside a transaction so a concurrent caller
-        // cannot race us into a duplicate creation.
-        const retried = await prisma.$transaction(async (tx) => {
-          const current = await tx.circleNexconnChannel.findUnique({
-            where: { circleId },
-            select: { creationStatus: true },
-          })
-          if (!current || current.creationStatus !== 'FAILED') {
-            return { retried: false }
-          }
-          await tx.circleNexconnChannel.update({
-            where: { circleId },
-            data: { creationStatus: 'PENDING', nexconnError: null },
-          })
-          return { retried: true }
-        })
-        if (!retried.retried) {
-          res.status(409).json({
-            error: 'Channel creation already in progress',
-            groupId,
-          })
-          return
-        }
-      }
-
-      // We claimed a fresh PENDING row, so proceed to create the external group.
-
-      // Fetch active members for the invitation list. Pulse Circle remains
-      // the source of truth for membership.
-      const members = await prisma.circleMember.findMany({
+      const channel = await prisma.circleNexconnChannel.findUnique({
         where: { circleId },
-        select: { userId: true },
-        orderBy: { joinedAt: 'asc' },
+        select: { groupId: true, creationStatus: true },
       })
-      const memberIds = members.map((m) => toNexconnUserId(m.userId))
-      const ownerNexconnId = toNexconnUserId(userId)
 
-      let result: Awaited<ReturnType<typeof createNexconnGroup>>
-      try {
-        result = await createNexconnGroup({
-          channelId: groupId,
-          name: `Pulse Circle ${circleId}`,
-          owner: ownerNexconnId,
-          userIds: memberIds.filter((id) => id !== ownerNexconnId),
-        })
-      } catch (err) {
-        // A thrown error means a network failure or HTTP error. The outcome
-        // is uncertain: the request may have reached Nexconn. Record PENDING
-        // so automatic recreation is blocked; the client must retry manually.
-        await prisma.circleNexconnChannel.update({
-          where: { circleId },
-          data: {
-            creationStatus: 'PENDING',
-            nexconnError: err instanceof Error ? err.message : 'nexconn_error',
-          },
-        })
-        res.status(503).json({
-          error: 'Unable to create the chat channel. Please try again later.',
+      if (!channel || channel.creationStatus !== 'CREATED') {
+        res.status(400).json({
+          error: 'Nexconn channel is not ready for messaging',
         })
         return
       }
 
-      if (result.ok) {
-        await prisma.circleNexconnChannel.update({
-          where: { circleId },
-          data: { creationStatus: 'CREATED', nexconnError: null },
+      const senderNexconnId = toNexconnUserId(userId)
+
+      const sendResult = await sendNexconnGroupMessage({
+        channelId: channel.groupId,
+        senderUserId: senderNexconnId,
+        text,
+      })
+
+      if (!sendResult.ok) {
+        res.status(502).json({
+          error: 'Failed to send message via Nexconn',
+          nexconnCode: sendResult.code,
         })
-        const response: NexconnChannelResponse = {
-          circleId,
-          groupId,
-          status: 'CREATED',
-        }
-        res.status(201).json(response)
         return
       }
 
-      // A clearly failed response (non-zero code) means the group was not
-      // created, so this is safe to retry.
-      await prisma.circleNexconnChannel.update({
-        where: { circleId },
-        data: {
-          creationStatus: 'FAILED',
-          nexconnError: `Nexconn code ${result.code}`,
-        },
-      })
-      res.status(502).json({
-        error: 'Unable to create the chat channel. Please try again later.',
-      })
+      res.status(200).json({ ok: true })
+      return
     } catch (err) {
       next(err)
     }
   }
 )
+
+/**
+ * Synchronize Pulse Circle members into an existing Nexconn group.
+ *
+ * Compares the Pulse Circle membership (source of truth) against actual
+ * Nexconn group members (paginated), then adds missing members in batches
+ * of at most 100. Lease ownership is verified and renewed before every
+ * external Nexconn request.
+ */
+async function syncNexconnMembers(
+  circleId: string,
+  groupId: string,
+  ownerNexconnId: string,
+  ownerToken: string,
+  ttlMs: number,
+): Promise<{
+  membersSynced: number
+  membersRemaining: number
+  complete: boolean
+  nexconnError?: string
+}> {
+  // Fetch all Pulse Circle members (source of truth).
+  const members = await prisma.circleMember.findMany({
+    where: { circleId },
+    select: { userId: true },
+    orderBy: { joinedAt: 'asc' },
+  })
+
+  const expectedNexconnIds = new Set(
+    members.map((m) => toNexconnUserId(m.userId)).filter((id) => id !== ownerNexconnId)
+  )
+
+  // Fetch all actual Nexconn members (paginated through all pages).
+  await assertCircleNexconnSyncLeaseHeld(circleId, ownerToken)
+  await renewCircleNexconnSyncLease(circleId, ownerToken, ttlMs)
+
+  const allMembers = await listAllNexconnGroupMembers({ channelId: groupId })
+
+  if (!allMembers.ok) {
+    return {
+      membersSynced: 0,
+      membersRemaining: expectedNexconnIds.size,
+      complete: false,
+      nexconnError: `Nexconn member-list error (code ${allMembers.code})`,
+    }
+  }
+
+  const actualNexconnIds = new Set(allMembers.memberIds)
+  let remainingIds = [...expectedNexconnIds].filter(
+    (id) => !actualNexconnIds.has(id),
+  )
+
+  if (remainingIds.length === 0) {
+    return { membersSynced: 0, membersRemaining: 0, complete: true }
+  }
+
+  const batchSize = 100
+  const membersSynced = 0
+  let nexconnError: string | undefined
+
+  while (remainingIds.length > 0) {
+    await assertCircleNexconnSyncLeaseHeld(circleId, ownerToken)
+    await renewCircleNexconnSyncLease(circleId, ownerToken, ttlMs)
+
+    const batch = remainingIds.slice(0, batchSize)
+
+    const joinResult = await addNexconnGroupMembers({
+      channelId: groupId,
+      userIds: batch,
+    })
+
+    if (joinResult.ok) {
+      remainingIds = remainingIds.slice(batch.length)
+    } else if (joinResult.code === 25412) {
+      // Already a member — non-fatal. Verify which batch members are present.
+      await assertCircleNexconnSyncLeaseHeld(circleId, ownerToken)
+      await renewCircleNexconnSyncLease(circleId, ownerToken, ttlMs)
+
+      const verifyResult = await listAllNexconnGroupMembers({ channelId: groupId })
+      if (!verifyResult.ok) {
+        return {
+          membersSynced,
+          membersRemaining: remainingIds.length,
+          complete: false,
+          nexconnError: `Join verification failed (code ${verifyResult.code})`,
+        }
+      }
+
+      const verifiedIds = new Set(verifyResult.memberIds)
+      remainingIds = remainingIds.filter((id) => !verifiedIds.has(id))
+    } else if (joinResult.code === 25411) {
+      // Capacity exceeded — safe partial sync, do not mark FAILED.
+      nexconnError = 'Nexconn group capacity exceeded'
+      break
+    } else {
+      // Other error — verify membership before deciding next steps.
+      await assertCircleNexconnSyncLeaseHeld(circleId, ownerToken)
+      await renewCircleNexconnSyncLease(circleId, ownerToken, ttlMs)
+
+      const verifyResult = await listAllNexconnGroupMembers({ channelId: groupId })
+      if (!verifyResult.ok) {
+        return {
+          membersSynced,
+          membersRemaining: remainingIds.length,
+          complete: false,
+          nexconnError: `Join error (code ${joinResult.code}) and verification failed`,
+        }
+      }
+
+      const verifiedIds = new Set(verifyResult.memberIds)
+      remainingIds = remainingIds.filter((id) => !verifiedIds.has(id))
+      nexconnError = `Nexconn join error (code ${joinResult.code})`
+    }
+  }
+
+  // Final verification of complete membership state.
+  await assertCircleNexconnSyncLeaseHeld(circleId, ownerToken)
+  await renewCircleNexconnSyncLease(circleId, ownerToken, ttlMs)
+
+  const finalResult = await listAllNexconnGroupMembers({ channelId: groupId })
+  if (!finalResult.ok) {
+    return {
+      membersSynced,
+      membersRemaining: remainingIds.length,
+      complete: false,
+      nexconnError: `Final verification failed (code ${finalResult.code})`,
+    }
+  }
+
+  const finalIds = new Set(finalResult.memberIds)
+  const trueRemaining = [...expectedNexconnIds].filter(
+    (id) => !finalIds.has(id),
+  ).length
+
+  const initiallyAbsent = [...expectedNexconnIds].filter(
+    (id) => !actualNexconnIds.has(id),
+  )
+  const newlyConfirmed = initiallyAbsent.filter(
+    (id) => finalIds.has(id),
+  ).length
+
+  return {
+    membersSynced: newlyConfirmed,
+    membersRemaining: trueRemaining,
+    complete: trueRemaining === 0,
+    ...(nexconnError ? { nexconnError } : {}),
+  }
+}
+
+async function updateCircleNexconnChannelFenced(
+  circleId: string,
+  ownerToken: string,
+  creationStatus: string,
+  nexconnError: string | null,
+): Promise<void> {
+  await prisma.$transaction(async (tx) => {
+    // Lock Circle row.
+    const circleRows = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+      `SELECT id FROM "Circle" WHERE id = $1 FOR UPDATE`,
+      circleId
+    )
+    if (circleRows.length === 0) {
+      throw new Error('Circle not found')
+    }
+
+    // Lock CircleNexconnChannel row.
+    const channelRows = await tx.$queryRawUnsafe<Array<{
+      syncLockOwner: string | null
+      syncLockExpiresAt: Date | null
+    }>>(
+      `SELECT "syncLockOwner", "syncLockExpiresAt"
+       FROM "CircleNexconnChannel"
+       WHERE "circleId" = $1
+       FOR UPDATE`,
+      circleId
+    )
+    if (channelRows.length === 0) {
+      throw new Error('Channel mapping not found')
+    }
+    const channel = channelRows[0]
+
+    // Verify owner and expiry using database clock_timestamp().
+    const timeRows = await tx.$queryRawUnsafe<{ now: Date }[]>(
+      `SELECT clock_timestamp() AS now`
+    )
+    const dbNow = timeRows[0].now
+
+    if (
+      channel.syncLockOwner !== ownerToken ||
+      channel.syncLockExpiresAt === null ||
+      channel.syncLockExpiresAt <= dbNow
+    ) {
+      throw new Error('Channel sync lease not held or expired')
+    }
+
+    // Conditional UPDATE — re-fences at execution time using clock_timestamp().
+    const result = await tx.$executeRawUnsafe(
+      `UPDATE "CircleNexconnChannel"
+       SET "creationStatus" = $1,
+           "nexconnError" = $2,
+           "updatedAt" = clock_timestamp()
+       WHERE "circleId" = $3
+         AND "syncLockOwner" = $4
+         AND "syncLockExpiresAt" > clock_timestamp()`,
+      creationStatus, nexconnError, circleId, ownerToken
+    )
+
+    if (result !== 1) {
+      throw new Error('Lease expired before channel state update; no rows updated')
+    }
+  })
+}
 
 export { router }

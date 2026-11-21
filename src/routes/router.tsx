@@ -8,6 +8,7 @@ import { MessagesPage } from '@/pages/MessagesPage'
 import { NotFoundPage } from '@/pages/NotFoundPage'
 import { RegisterPage } from '@/pages/RegisterPage'
 import { SignInPage } from '@/pages/SignInPage'
+import { AcceptInvitePage } from '@/pages/AcceptInvitePage'
 import { AppLayout } from '@/components/layout/AppLayout'
 import { paths, notFoundPath } from '@/routes/paths'
 
@@ -15,6 +16,7 @@ export const router = createBrowserRouter([
   { path: paths.landing, element: <LandingPage /> },
   { path: paths.signIn, element: <SignInPage /> },
   { path: paths.register, element: <RegisterPage /> },
+  { path: paths.acceptInvite, element: <AcceptInvitePage /> },
   {
     element: <AppLayout />,
     children: [

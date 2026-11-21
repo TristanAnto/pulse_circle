@@ -2,7 +2,6 @@ import { Outlet } from 'react-router-dom'
 
 import { Header } from './Header'
 import { MobileNavigation } from './MobileNavigation'
-import { Sidebar } from './Sidebar'
 
 export function AppLayout() {
   return (
@@ -14,17 +13,13 @@ export function AppLayout() {
         Skip to main content
       </a>
 
-      <Sidebar />
-
-      <div className="lg:pl-72">
-        <Header />
-        <main
-          id="main-content"
-          className="mx-auto w-full max-w-6xl px-4 pb-28 pt-6 sm:px-6 lg:pb-12"
-        >
-          <Outlet />
-        </main>
-      </div>
+      <Header />
+      <main
+        id="main-content"
+        className="mx-auto w-full max-w-6xl px-4 pb-28 pt-6 sm:px-6 lg:pb-12"
+      >
+        <Outlet />
+      </main>
 
       <MobileNavigation />
     </div>

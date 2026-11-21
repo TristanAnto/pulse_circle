@@ -26,6 +26,8 @@ export function DashboardPage() {
           firstName="Lakshmi"
           today={formatLongDate(new Date().toISOString())}
           state={checkInStatus.state}
+          circleMembers={circleMembers}
+          activityFeed={activityFeed}
         />
         <CheckInCard status={checkInStatus} />
         <EscalationStatus steps={escalationSteps} activeAlert={false} />

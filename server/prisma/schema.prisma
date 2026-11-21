@@ -79,20 +79,22 @@ enum InvitationStatus {
 }
 
 model User {
-  id            String      @id @default(uuid())
-  fullName      String
-  email         String      @unique
-  passwordHash  String?
-  phoneNumber   String?
-  createdAt     DateTime    @default(now())
-  updatedAt     DateTime    @updatedAt
+  id           String   @id @default(uuid())
+  fullName     String
+  email        String   @unique
+  passwordHash String?
+  phoneNumber  String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 
-  circles       CircleMember[]
-  checkIns      CheckIn[]
-  notifications Notification[]
-  receivedEvents EscalationEvent[] @relation("EscalationEventRecipient")
-  invitationsSent   CircleInvitation[] @relation("CircleInvitationInviter")
+  circles             CircleMember[]
+  checkIns            CheckIn[]
+  notifications       Notification[]
+  receivedEvents      EscalationEvent[]  @relation("EscalationEventRecipient")
+  invitationsSent     CircleInvitation[] @relation("CircleInvitationInviter")
   invitationsReceived CircleInvitation[] @relation("CircleInvitationInvitee")
+  removalRecordsAsTarget NexconnRemovalRecord[] @relation("RemovalTarget")
+  removalRecordsAsRequester NexconnRemovalRecord[] @relation("RemovalRequester")
 
   @@index([createdAt])
 }
@@ -104,19 +106,19 @@ model Circle {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  members     CircleMember[]
-  schedules   CheckInSchedule[]
-  checkIns    CheckIn[]
-  notifications Notification[]
-  invitations CircleInvitation[]
+  members        CircleMember[]
+  schedules      CheckInSchedule[]
+  checkIns       CheckIn[]
+  notifications  Notification[]
+  invitations    CircleInvitation[]
   nexconnChannel CircleNexconnChannel?
+  removalRecords NexconnRemovalRecord[]
 
   @@index([createdAt])
 }
 
 /**
  * Maps a Pulse Circle to a single Nexconn group channel.
- *
  * One Nexconn group per Pulse Circle. The `groupId` is unique so two rows
  * can never reference the same Nexconn group, and the `circleId` primary key
  * makes the mapping one-to-one. `creationStatus` records whether the Nexconn
@@ -124,18 +126,50 @@ model Circle {
  * outcome) can never trigger a second group creation.
  */
 model CircleNexconnChannel {
-  circleId        String               @id
-  groupId         String               @unique
-  ownerUserId     String
-  creationStatus  CircleChannelStatus @default(PENDING)
-  nexconnError    String?
-  createdAt      DateTime             @default(now())
-  updatedAt      DateTime             @updatedAt
+  circleId          String              @id
+  groupId           String              @unique
+  ownerUserId       String
+  creationStatus    CircleChannelStatus @default(PENDING)
+  nexconnError      String?
+  syncLockOwner     String?
+  syncLockExpiresAt DateTime?
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
 
   circle Circle @relation(fields: [circleId], references: [id], onDelete: Cascade)
 
   @@index([creationStatus])
   @@index([createdAt])
+  @@index([syncLockExpiresAt])
+}
+
+model NexconnRemovalRecord {
+  id               String              @id @default(uuid())
+  circleId           String?
+  targetUserId       String?
+  requestingUserId   String?
+  nexconnUserId      String
+  groupId            String?
+  status             RemovalRecordStatus @default(PENDING)
+  claimedBy          String?
+  claimExpiresAt     DateTime?
+  retrySourceId      String?
+  idempotencyKey     String
+  nexconnError       String?
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+
+  circle   Circle?   @relation(fields: [circleId], references: [id], onDelete: SetNull)
+  target   User?    @relation("RemovalTarget", fields: [targetUserId], references: [id], onDelete: SetNull)
+  requester User?   @relation("RemovalRequester", fields: [requestingUserId], references: [id], onDelete: SetNull)
+  source   NexconnRemovalRecord? @relation("RemovalRetry", fields: [retrySourceId], references: [id], onDelete: Restrict)
+  retry    NexconnRemovalRecord? @relation("RemovalRetry")
+
+  @@unique([idempotencyKey])
+  @@unique([retrySourceId])
+  @@index([circleId])
+  @@index([status])
+  @@index([claimExpiresAt])
 }
 
 enum CircleChannelStatus {
@@ -144,15 +178,22 @@ enum CircleChannelStatus {
   FAILED
 }
 
-model CircleMember {
-  id        String      @id @default(uuid())
-  userId    String
-  circleId  String
-  role      MemberRole
-  joinedAt  DateTime    @default(now())
+enum RemovalRecordStatus {
+  PENDING
+  REMOVED
+  FAILED
+  UNKNOWN
+}
 
-  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  circle  Circle   @relation(fields: [circleId], references: [id], onDelete: Cascade)
+model CircleMember {
+  id       String     @id @default(uuid())
+  userId   String
+  circleId String
+  role     MemberRole
+  joinedAt DateTime   @default(now())
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  circle Circle @relation(fields: [circleId], references: [id], onDelete: Cascade)
 
   // One user can belong to a given circle only once.
   @@unique([userId, circleId])
@@ -161,33 +202,33 @@ model CircleMember {
 }
 
 model CheckInSchedule {
-  id          String   @id @default(uuid())
-  circleId    String
+  id            String   @id @default(uuid())
+  circleId      String
   // "HH:MM" local time of day (PostgreSQL has no standalone time type in
   // Prisma; stored as text and validated by the application layer).
   scheduledTime String
-  timezone    String   @default("UTC")
-  isActive    Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  timezone      String   @default("UTC")
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 
-  circle    Circle @relation(fields: [circleId], references: [id], onDelete: Cascade)
+  circle Circle @relation(fields: [circleId], references: [id], onDelete: Cascade)
 
   @@index([circleId])
   @@index([isActive])
 }
 
 model CheckIn {
-  id          String          @id @default(uuid())
+  id          String        @id @default(uuid())
   userId      String
   circleId    String
-  status      CheckInStatus   @default(PENDING)
+  status      CheckInStatus @default(PENDING)
   checkedInAt DateTime?
-  createdAt   DateTime        @default(now())
-  updatedAt   DateTime        @updatedAt
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
 
-  user      User     @relation(fields: [userId], references: [id], onDelete: Restrict)
-  circle    Circle   @relation(fields: [circleId], references: [id], onDelete: Restrict)
+  user       User        @relation(fields: [userId], references: [id], onDelete: Restrict)
+  circle     Circle      @relation(fields: [circleId], references: [id], onDelete: Restrict)
   escalation Escalation?
 
   // Ready for future missed-check-in tracking: query by circle + status +
@@ -199,32 +240,32 @@ model CheckIn {
 }
 
 model Escalation {
-  id          String           @id @default(uuid())
-  checkInId   String           @unique
-  status      EscalationStatus @default(PENDING)
-  currentLevel Int             @default(1)
-  startedAt   DateTime         @default(now())
-  resolvedAt  DateTime?
-  createdAt   DateTime         @default(now())
-  updatedAt   DateTime         @updatedAt
+  id           String           @id @default(uuid())
+  checkInId    String           @unique
+  status       EscalationStatus @default(PENDING)
+  currentLevel Int              @default(1)
+  startedAt    DateTime         @default(now())
+  resolvedAt   DateTime?
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
 
-  checkIn   CheckIn @relation(fields: [checkInId], references: [id], onDelete: Restrict)
-  events    EscalationEvent[]
+  checkIn CheckIn           @relation(fields: [checkInId], references: [id], onDelete: Restrict)
+  events  EscalationEvent[]
 
   @@index([status])
   @@index([createdAt])
 }
 
 model EscalationEvent {
-  id          String                @id @default(uuid())
+  id           String              @id @default(uuid())
   escalationId String
   recipientId  String
   level        Int
   eventType    EscalationEventType
-  createdAt    DateTime @default(now())
+  createdAt    DateTime            @default(now())
 
   escalation Escalation @relation(fields: [escalationId], references: [id], onDelete: Cascade)
-  recipient  User     @relation("EscalationEventRecipient", fields: [recipientId], references: [id], onDelete: Restrict)
+  recipient  User       @relation("EscalationEventRecipient", fields: [recipientId], references: [id], onDelete: Restrict)
 
   @@index([escalationId])
   @@index([recipientId])
@@ -232,18 +273,18 @@ model EscalationEvent {
 }
 
 model Notification {
-  id          String              @id @default(uuid())
-  userId      String
-  circleId    String?
-  type        NotificationType
-  title       String
-  message     String
-  status      NotificationStatus  @default(PENDING)
-  readAt      DateTime?
-  createdAt   DateTime            @default(now())
+  id        String             @id @default(uuid())
+  userId    String
+  circleId  String?
+  type      NotificationType
+  title     String
+  message   String
+  status    NotificationStatus @default(PENDING)
+  readAt    DateTime?
+  createdAt DateTime           @default(now())
 
-  user    User   @relation(fields: [userId], references: [id], onDelete: Cascade)
-  circle  Circle? @relation(fields: [circleId], references: [id], onDelete: SetNull)
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  circle Circle? @relation(fields: [circleId], references: [id], onDelete: SetNull)
 
   @@index([userId])
   @@index([circleId])
@@ -252,22 +293,22 @@ model Notification {
 }
 
 model CircleInvitation {
-  id          String      @id @default(uuid())
-  circleId    String
-  inviterId   String?
+  id           String           @id @default(uuid())
+  circleId     String
+  inviterId    String?
   inviteeEmail String
-  inviteeId   String?
-  role        MemberRole    @default(NEIGHBOR)
-  status      InvitationStatus @default(PENDING)
-  tokenHash   String        @unique
-  expiresAt   DateTime
-  createdAt   DateTime      @default(now())
-  updatedAt   DateTime      @updatedAt
-  acceptedAt  DateTime?
+  inviteeId    String?
+  role         MemberRole       @default(NEIGHBOR)
+  status       InvitationStatus @default(PENDING)
+  tokenHash    String           @unique
+  expiresAt    DateTime
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+  acceptedAt   DateTime?
 
-  circle    Circle   @relation(fields: [circleId], references: [id], onDelete: Restrict)
-  inviter   User?    @relation("CircleInvitationInviter", fields: [inviterId], references: [id], onDelete: SetNull)
-  invitee   User?    @relation("CircleInvitationInvitee", fields: [inviteeId], references: [id], onDelete: SetNull)
+  circle  Circle @relation(fields: [circleId], references: [id], onDelete: Restrict)
+  inviter User?  @relation("CircleInvitationInviter", fields: [inviterId], references: [id], onDelete: SetNull)
+  invitee User?  @relation("CircleInvitationInvitee", fields: [inviteeId], references: [id], onDelete: SetNull)
 
   @@index([circleId])
   @@index([inviterId])
