@@ -1,6 +1,11 @@
 import { useEffect, useState } from 'react'
 
 import { api } from '@/lib/api'
+import {
+  connectNexconn,
+  disconnectNexconn,
+  initNexconn,
+} from '@/lib/nexconn'
 import { AuthContext } from '@/context/auth'
 import type {
   AuthenticatedUser,
@@ -17,6 +22,7 @@ export function AuthProvider({
   const [user, setUser] = useState<AuthenticatedUser | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const isAuthenticated = user !== null
 
   useEffect(() => {
     let cancelled = false
@@ -55,6 +61,36 @@ export function AuthProvider({
     }
   }, [])
 
+  // Initialize Nexconn once at provider boot. Failures are non-fatal: the
+  // chat layer degrades gracefully and the app keeps working.
+  useEffect(() => {
+    let cancelled = false
+    const run = async () => {
+      initNexconn()
+      if (cancelled) return
+    }
+    void run()
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  // Connect/disconnect Nexconn based on auth state. This single effect
+  // covers session restoration, login, registration, and logout. Nexconn
+  // failures are swallowed so they never block the app.
+  useEffect(() => {
+    if (loading) return
+    if (!isAuthenticated) {
+      void disconnectNexconn().catch(() => {
+        /* ignore */
+      })
+      return
+    }
+    void connectNexconn().catch(() => {
+      /* ignore */
+    })
+  }, [isAuthenticated, loading])
+
   const login = async (credentials: LoginRequest): Promise<void> => {
     const data = (await api.post('/api/auth/login', credentials)) as {
       user: AuthenticatedUser
@@ -82,11 +118,11 @@ export function AuthProvider({
     setError(null)
   }
 
-  const value = {
+const value = {
     user,
     loading,
     error,
-    isAuthenticated: user !== null,
+    isAuthenticated,
     login,
     register,
     logout,

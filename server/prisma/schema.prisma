@@ -109,8 +109,39 @@ model Circle {
   checkIns    CheckIn[]
   notifications Notification[]
   invitations CircleInvitation[]
+  nexconnChannel CircleNexconnChannel?
 
   @@index([createdAt])
+}
+
+/**
+ * Maps a Pulse Circle to a single Nexconn group channel.
+ *
+ * One Nexconn group per Pulse Circle. The `groupId` is unique so two rows
+ * can never reference the same Nexconn group, and the `circleId` primary key
+ * makes the mapping one-to-one. `creationStatus` records whether the Nexconn
+ * create call completed, so an uncertain API response (timeout / unknown
+ * outcome) can never trigger a second group creation.
+ */
+model CircleNexconnChannel {
+  circleId        String               @id
+  groupId         String               @unique
+  ownerUserId     String
+  creationStatus  CircleChannelStatus @default(PENDING)
+  nexconnError    String?
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
+
+  circle Circle @relation(fields: [circleId], references: [id], onDelete: Cascade)
+
+  @@index([creationStatus])
+  @@index([createdAt])
+}
+
+enum CircleChannelStatus {
+  PENDING
+  CREATED
+  FAILED
 }
 
 model CircleMember {

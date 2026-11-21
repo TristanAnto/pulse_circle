@@ -51,6 +51,9 @@ export const env = {
     (process.env.COOKIE_SECURE ?? isProduction ? 'true' : 'false') === 'true',
   cookieSameSite,
   corsOrigin,
+  nexconnAppKey: process.env.NEXCONN_APP_KEY ?? '',
+  nexconnAppSecret: process.env.NEXCONN_APP_SECRET ?? '',
+  nexconnBaseUrl: process.env.NEXCONN_BASE_URL ?? 'https://api.sg-light-api.com',
 }
 
 /**

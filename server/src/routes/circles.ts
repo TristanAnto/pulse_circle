@@ -6,6 +6,11 @@ import { authenticate, csrfProtection, type AuthenticatedRequest } from '../midd
 import { membershipRequired, type CircleMembershipRequest } from '../middleware/membership'
 import { roleRequired } from '../middleware/role'
 import { prisma } from '../lib/prisma'
+import { toNexconnUserId } from '../lib/nexconn'
+import {
+  createNexconnGroup,
+  toNexconnGroupId,
+} from '../lib/nexconnGroup'
 import { InvitationStatus, MemberRole, Prisma } from '@prisma/client'
 import { generateInvitationToken, hashInvitationToken } from '../lib/invitation'
 import { sendInvitationEmail } from '../lib/email'
@@ -80,6 +85,33 @@ type CircleMemberResponse = {
   fullName: string
   role: MemberRole
   joinedAt: Date
+}
+
+/**
+ * Response for the Nexconn group-channel resolution endpoint.
+ *
+ * Only the opaque Nexconn group ID is exposed — never the App Key, App
+ * Secret, access token, or the circle's member list.
+ */
+type NexconnChannelResponse = {
+  circleId: string
+  groupId: string
+  status: 'CREATED' | 'PENDING' | 'FAILED'
+}
+
+/**
+ * Nexconn recipient entry for a circle member.
+ *
+ * Only the minimum information needed to address a member through a Nexconn
+ * DirectChannel is exposed: the member's display name and the canonical
+ * Nexconn user ID derived from the stored UUID. No credentials, tokens, or
+ * App Secret are ever returned.
+ */
+type NexconnRecipientResponse = {
+  userId: string
+  nexconnUserId: string
+  fullName: string
+  role: MemberRole
 }
 
 /**
@@ -309,6 +341,64 @@ router.get(
       }))
 
       res.json({ members: response })
+    } catch (err) {
+      next(err)
+    }
+  }
+)
+
+/**
+ * GET /api/circles/:circleId/nexconn-recipients
+ * Resolves the Nexconn user IDs of a circle's members for direct messaging.
+ *
+ * Requires authentication and active membership in the requested circle, so
+ * users outside the circle cannot enumerate its members. The caller's own
+ * entry is included so the client can address itself (e.g. for self-notes) or
+ * simply know which ID is theirs.
+ *
+ * Nexconn user IDs are derived from the stored UUID via the canonical
+ * transformation used by token issuance (toNexconnUserId), so the IDs returned
+ * here are the same ones accepted by DirectChannelIdentifier.
+ */
+router.get(
+  '/:circleId/nexconn-recipients',
+  authenticate,
+  membershipRequired('circleId'),
+  async (
+    req: CircleMembershipRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    if (!req.circleMembership) {
+      res.status(403).json({ error: 'Membership required' })
+      return
+    }
+
+    const circleId = req.circleMembership.circleId
+
+    try {
+      const members = await prisma.circleMember.findMany({
+        where: { circleId },
+        select: {
+          userId: true,
+          role: true,
+          user: {
+            select: {
+              fullName: true,
+            },
+          },
+        },
+        orderBy: { joinedAt: 'asc' },
+      })
+
+      const recipients: NexconnRecipientResponse[] = members.map((m) => ({
+        userId: m.userId,
+        nexconnUserId: toNexconnUserId(m.userId),
+        fullName: m.user.fullName,
+        role: m.role,
+      }))
+
+      res.json({ recipients })
     } catch (err) {
       next(err)
     }
@@ -707,6 +797,262 @@ router.post(
           role: invitation.role,
           status: 'DECLINED',
         },
+      })
+    } catch (err) {
+      next(err)
+    }
+  }
+)
+
+/**
+ * GET /api/circles/:circleId/nexconn-channel
+ * Resolves the Nexconn group channel mapped to a Pulse Circle.
+ *
+ * Requires authentication and active membership. Returns only the mapped
+ * group ID and creation status — never credentials, tokens, or member lists.
+ * A missing mapping is reported as 404 so the client can distinguish
+ * "not created yet" from "not authorized".
+ */
+router.get(
+  '/:circleId/nexconn-channel',
+  authenticate,
+  membershipRequired('circleId'),
+  async (
+    req: CircleMembershipRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    if (!req.circleMembership) {
+      res.status(403).json({ error: 'Membership required' })
+      return
+    }
+
+    const circleId = req.circleMembership.circleId
+
+    try {
+      const channel = await prisma.circleNexconnChannel.findUnique({
+        where: { circleId },
+        select: {
+          circleId: true,
+          groupId: true,
+          creationStatus: true,
+        },
+      })
+
+      if (!channel) {
+        res.status(404).json({ error: 'Nexconn channel not created for this circle' })
+        return
+      }
+
+      const response: NexconnChannelResponse = {
+        circleId: channel.circleId,
+        groupId: channel.groupId,
+        status: channel.creationStatus,
+      }
+      res.json(response)
+    } catch (err) {
+      next(err)
+    }
+  }
+)
+
+/**
+ * POST /api/circles/:circleId/nexconn-channel
+ * Creates the Nexconn group channel for a Pulse Circle, if one does not
+ * already exist.
+ *
+ * Uses a database claim so concurrent callers cannot create duplicate groups.
+ * An uncertain Nexconn response (timeout, unknown outcome) is recorded as
+ * PENDING and never triggers automatic recreation; only a clearly failed
+ * response is marked FAILED and made retryable.
+ */
+router.post(
+  '/:circleId/nexconn-channel',
+  authenticate,
+  csrfProtection,
+  membershipRequired('circleId'),
+  async (
+    req: CircleMembershipRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    if (!req.circleMembership) {
+      res.status(403).json({ error: 'Membership required' })
+      return
+    }
+
+    const circleId = req.circleMembership.circleId
+    const userId = req.circleMembership.userId
+    const groupId = toNexconnGroupId(circleId)
+
+    let claimed: { claimed: boolean; existing: { groupId: string; creationStatus: string } | null }
+    try {
+      // Claim the row first, inside a transaction, so two simultaneous
+      // requests cannot both proceed to create an external group.
+      claimed = await prisma.$transaction(async (tx) => {
+        const existing = await tx.circleNexconnChannel.findUnique({
+          where: { circleId },
+          select: { groupId: true, creationStatus: true },
+        })
+
+        if (existing) {
+          return { claimed: false, existing }
+        }
+
+        await tx.circleNexconnChannel.create({
+          data: {
+            circleId,
+            groupId,
+            ownerUserId: userId,
+            creationStatus: 'PENDING',
+          },
+          select: { circleId: true, groupId: true, creationStatus: true },
+        })
+
+        return { claimed: true, existing: null }
+      })
+    } catch (err) {
+      // P2002: another concurrent request claimed the row first. Re-read the
+      // mapping and return it or 409 instead of surfacing a raw Prisma error.
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        const current = await prisma.circleNexconnChannel.findUnique({
+          where: { circleId },
+          select: { circleId: true, groupId: true, creationStatus: true },
+        })
+        if (!current) {
+          next(err)
+          return
+        }
+        if (current.creationStatus === 'CREATED') {
+          const response: NexconnChannelResponse = {
+            circleId: current.circleId,
+            groupId: current.groupId,
+            status: 'CREATED',
+          }
+          res.json(response)
+          return
+        }
+        res.status(409).json({
+          error: 'Channel creation already in progress',
+          groupId: current.groupId,
+        })
+        return
+      }
+      next(err)
+      return
+    }
+
+    try {
+      // claimed.existing is set when a row already existed; null means we just
+      // claimed a fresh PENDING row and should proceed to create the group.
+      if (claimed.existing) {
+        const existing = claimed.existing
+        if (existing.creationStatus === 'CREATED') {
+          const response: NexconnChannelResponse = {
+            circleId: req.params.circleId,
+            groupId: existing.groupId,
+            status: 'CREATED',
+          }
+          res.json(response)
+          return
+        }
+
+        if (existing.creationStatus === 'PENDING') {
+          res.status(409).json({
+            error: 'Channel creation already in progress',
+            groupId,
+          })
+          return
+        }
+
+        // FAILED: a prior attempt clearly failed, so this is safe to retry.
+        // Flip back to PENDING inside a transaction so a concurrent caller
+        // cannot race us into a duplicate creation.
+        const retried = await prisma.$transaction(async (tx) => {
+          const current = await tx.circleNexconnChannel.findUnique({
+            where: { circleId },
+            select: { creationStatus: true },
+          })
+          if (!current || current.creationStatus !== 'FAILED') {
+            return { retried: false }
+          }
+          await tx.circleNexconnChannel.update({
+            where: { circleId },
+            data: { creationStatus: 'PENDING', nexconnError: null },
+          })
+          return { retried: true }
+        })
+        if (!retried.retried) {
+          res.status(409).json({
+            error: 'Channel creation already in progress',
+            groupId,
+          })
+          return
+        }
+      }
+
+      // We claimed a fresh PENDING row, so proceed to create the external group.
+
+      // Fetch active members for the invitation list. Pulse Circle remains
+      // the source of truth for membership.
+      const members = await prisma.circleMember.findMany({
+        where: { circleId },
+        select: { userId: true },
+        orderBy: { joinedAt: 'asc' },
+      })
+      const memberIds = members.map((m) => toNexconnUserId(m.userId))
+      const ownerNexconnId = toNexconnUserId(userId)
+
+      let result: Awaited<ReturnType<typeof createNexconnGroup>>
+      try {
+        result = await createNexconnGroup({
+          channelId: groupId,
+          name: `Pulse Circle ${circleId}`,
+          owner: ownerNexconnId,
+          userIds: memberIds.filter((id) => id !== ownerNexconnId),
+        })
+      } catch (err) {
+        // A thrown error means a network failure or HTTP error. The outcome
+        // is uncertain: the request may have reached Nexconn. Record PENDING
+        // so automatic recreation is blocked; the client must retry manually.
+        await prisma.circleNexconnChannel.update({
+          where: { circleId },
+          data: {
+            creationStatus: 'PENDING',
+            nexconnError: err instanceof Error ? err.message : 'nexconn_error',
+          },
+        })
+        res.status(503).json({
+          error: 'Unable to create the chat channel. Please try again later.',
+        })
+        return
+      }
+
+      if (result.ok) {
+        await prisma.circleNexconnChannel.update({
+          where: { circleId },
+          data: { creationStatus: 'CREATED', nexconnError: null },
+        })
+        const response: NexconnChannelResponse = {
+          circleId,
+          groupId,
+          status: 'CREATED',
+        }
+        res.status(201).json(response)
+        return
+      }
+
+      // A clearly failed response (non-zero code) means the group was not
+      // created, so this is safe to retry.
+      await prisma.circleNexconnChannel.update({
+        where: { circleId },
+        data: {
+          creationStatus: 'FAILED',
+          nexconnError: `Nexconn code ${result.code}`,
+        },
+      })
+      res.status(502).json({
+        error: 'Unable to create the chat channel. Please try again later.',
       })
     } catch (err) {
       next(err)

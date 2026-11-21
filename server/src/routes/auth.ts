@@ -1,4 +1,4 @@
-import { Request, Response, Router } from 'express'
+import { NextFunction, Request, Response, Router } from 'express'
 import { z } from 'zod'
 import rateLimit from 'express-rate-limit'
 
@@ -13,6 +13,7 @@ import {
 } from '../lib/auth'
 import { prisma } from '../lib/prisma'
 import { env } from '../config/env'
+import { issueNexconnToken } from '../lib/nexconn'
 
 const router = Router()
 
@@ -144,5 +145,38 @@ router.get('/me', authenticate, async (req: AuthenticatedRequest, res) => {
 
   res.json({ user: safeUser(user) })
 })
+
+router.post(
+  '/nexconn-token',
+  authenticate,
+  csrfProtection,
+  async (req: AuthenticatedRequest, res: Response, _next: NextFunction): Promise<void> => {
+    if (!req.user?.userId) {
+      res.status(401).json({ error: 'Authentication required' })
+      return
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.userId },
+      select: { id: true, fullName: true },
+    })
+
+    if (!user) {
+      res.status(401).json({ error: 'User not found' })
+      return
+    }
+
+    try {
+      const tokenResult = await issueNexconnToken(user.id, user.fullName)
+      res.json({
+        nexconnUserId: tokenResult.nexconnUserId,
+        accessToken: tokenResult.accessToken,
+      })
+    } catch {
+      res.status(503).json({ error: 'Chat service unavailable' })
+      return
+    }
+  }
+)
 
 export { router }

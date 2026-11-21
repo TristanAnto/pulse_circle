@@ -10,6 +10,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@nexconn/chat": "^26.5.1",
+    "@nexconn/engine": "^26.5.1",
     "@tailwindcss/vite": "^4.3.5",
     "lucide-react": "^1.76.0",
     "react": "^19.3.1",
