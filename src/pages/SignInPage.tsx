@@ -84,27 +84,38 @@ export function SignInPage() {
         </div>
       </header>
 
-      <main id="main-content" className="mx-auto w-full max-w-7xl px-4 sm:px-6 lg:px-8 py-12 sm:py-24">
+      <main id="main-content" className="mx-auto w-full max-w-7xl px-4 sm:px-6 lg:px-8 py-6 sm:py-10 lg:py-12">
         <div
           className={cn(
-            'flex flex-col gap-10 sm:gap-12 items-center',
-            'lg:flex-row lg:items-start lg:gap-12'
+            'flex flex-col gap-6 items-center',
+            'sm:flex-row sm:items-start sm:gap-8'
           )}
         >
-          {/* Left: Branding section (desktop only two-column) */}
-          <div className="flex flex-col gap-6 items-center text-center sm:text-center lg:text-left w-full lg:w-[44%]">
-            <BrandMark className="mx-auto lg:mx-0" />
-            <div className="space-y-3 max-w-xl sm:max-w-none lg:max-w-none">
-              <p className="text-lg text-ink-muted sm:text-xl">
+          {/* Left: Branding section (compact on mobile, two-column on tablet+) */}
+          <div className={cn(
+            'flex flex-col items-center text-center gap-4 w-full',
+            'sm:text-left sm:items-start sm:w-full md:w-[48%] lg:w-[44%]'
+          )}
+          >
+            <div className="flex flex-col items-center sm:items-start gap-2">
+              <BrandMark className="mx-auto sm:mx-0" />
+              <p className="text-lg font-semibold text-ink text-center sm:text-left">
                 Sign in to your Pulse Circle account.
               </p>
             </div>
 
-            <div className="mt-8 flex flex-col gap-4 w-full sm:max-w-none lg:max-w-none">
+            {/* Marketing feature descriptions — hidden on narrow mobile screens */}
+            <div className={cn(
+              'hidden sm:flex flex-col gap-4 mt-4 sm:mt-6 w-full',
+              'sm:max-w-none'
+            )}
+            >
               <div className="flex items-start gap-3">
                 <HeartPulse className="size-5 text-pulse-700 shrink-0 mt-0.5" />
                 <div>
-                  <p className="font-semibold text-ink">Daily check-ins</p>
+                  <p className="font-semibold text-ink text-sm sm:text-base">
+                    Daily check-ins
+                  </p>
                   <p className="text-sm text-ink-muted">
                     One tap tells your circle you are alright.
                   </p>
@@ -113,7 +124,9 @@ export function SignInPage() {
               <div className="flex items-start gap-3">
                 <ShieldCheck className="size-5 text-pulse-700 shrink-0 mt-0.5" />
                 <div>
-                  <p className="font-semibold text-ink">Calm escalation</p>
+                  <p className="font-semibold text-ink text-sm sm:text-base">
+                    Calm escalation
+                  </p>
                   <p className="text-sm text-ink-muted">
                     Clear steps replace guesswork when a check-in is missed.
                   </p>
@@ -122,7 +135,9 @@ export function SignInPage() {
               <div className="flex items-start gap-3">
                 <Users className="size-5 text-pulse-700 shrink-0 mt-0.5" />
                 <div>
-                  <p className="font-semibold text-ink">Trusted circle</p>
+                  <p className="font-semibold text-ink text-sm sm:text-base">
+                    Trusted circle
+                  </p>
                   <p className="text-sm text-ink-muted">
                     Neighbours and family share one coordinated view.
                   </p>
@@ -132,10 +147,10 @@ export function SignInPage() {
           </div>
 
           {/* Right: Sign in form */}
-          <div className="flex-1 w-full lg:w-[56%]">
-            <Card className="mx-auto lg:mx-0 max-w-md lg:max-w-none">
+          <div className="flex-1 w-full">
+            <Card className="mx-auto sm:mx-0 max-w-sm sm:max-w-none">
               <div className="px-6 py-6 sm:px-8">
-                <BrandMark compact className="mx-auto lg:mx-0 mb-4" />
+                <BrandMark compact className="mx-auto sm:mx-0 mb-4" />
                 <h2 className="mt-2 text-3xl font-semibold tracking-tight text-center sm:text-4xl lg:text-left">
                   Sign in
                 </h2>
@@ -145,7 +160,7 @@ export function SignInPage() {
 
                 <form
                   onSubmit={handleSubmit}
-                  className="mt-10 space-y-6 sm:space-y-8"
+                  className="mt-8 space-y-6 sm:space-y-8"
                   noValidate
                 >
                   <div className="space-y-2">
