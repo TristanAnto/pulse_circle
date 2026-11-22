@@ -183,11 +183,26 @@ export async function listNexconnGroupMembers(params: {
   pageToken?: string
   pageSize?: number
 }): Promise<NexconnGroupMemberListResult> {
-  const response = await signedPost('/v4/group-channel/member/list', {
-    channelId: params.channelId,
-    ...(params.pageToken ? { pageToken: params.pageToken } : {}),
-    ...(params.pageSize ? { pageSize: params.pageSize } : {}),
-  })
+  let response: Response
+  try {
+    response = await signedPost('/v4/group-channel/member/list', {
+      channelId: params.channelId,
+      ...(params.pageToken ? { pageToken: params.pageToken } : {}),
+      ...(params.pageSize ? { pageSize: params.pageSize } : {}),
+    })
+  } catch (err) {
+    const providerErr = err as {
+      code?: number
+      providerCode?: number
+      timedOut?: boolean
+    }
+    return {
+      ok: false,
+      code: providerErr.providerCode ?? providerErr.code ?? 0,
+      body: null,
+      timedOut: providerErr.timedOut ?? false,
+    }
+  }
 
   let body: unknown
   try {

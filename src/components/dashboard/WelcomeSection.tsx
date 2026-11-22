@@ -92,7 +92,7 @@ export function WelcomeSection({
           </div>
         </div>
 
-        <div className="mt-4 flex flex-col sm:flex-row gap-2 sm:gap-3">
+        <div className="mt-3 flex flex-col sm:flex-row gap-2 sm:gap-3">
           <ButtonLink
             to={paths.checkIn}
             size="sm"

@@ -5,6 +5,7 @@ import { BrandMark } from '@/components/ui/BrandMark'
 import { Button } from '@/components/ui/Button'
 import { Card } from '@/components/ui/Card'
 import { StatusBadge } from '@/components/ui/StatusBadge'
+import type { AccountRole } from '@/types/auth'
 import { useAuth } from '@/context/auth'
 import { paths } from '@/routes/paths'
 
@@ -15,6 +16,7 @@ export function RegisterPage() {
   const [showConfirmPassword, setShowConfirmPassword] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
   const [isSubmitting, setIsSubmitting] = React.useState(false)
+  const [accountRole, setAccountRole] = React.useState<AccountRole>('ELDER')
   const { register, user, loading } = useAuth()
   const navigate = useNavigate()
   const location = useLocation()
@@ -78,7 +80,7 @@ export function RegisterPage() {
     }
 
     try {
-      await register({ fullName, email, password })
+      await register({ fullName, email, password, accountRole })
       // Redirect to dashboard is handled by the useEffect above once `user` is set.
     } catch (err) {
       setError((err as Error).message ?? 'Registration failed. Please try again.')
@@ -208,6 +210,40 @@ export function RegisterPage() {
                     )}
                   </button>
                 </div>
+              </div>
+
+              <div className="space-y-2">
+                <label htmlFor="account-role" className="block text-base font-semibold">
+                  Account role
+                </label>
+                <div className="grid gap-2 sm:grid-cols-3">
+              {[
+                { value: 'ELDER' as AccountRole, label: 'Elder' },
+                { value: 'FAMILY_MEMBER' as AccountRole, label: 'Family member' },
+                { value: 'NEIGHBOUR' as AccountRole, label: 'Neighbour' },
+                { value: 'GUARDIAN' as AccountRole, label: 'Guardian' },
+                { value: 'OTHER' as AccountRole, label: 'Other' },
+              ].map((option) => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      role="radio"
+                      aria-checked={accountRole === option.value}
+                      onClick={() => setAccountRole(option.value)}
+                      className={`min-h-14 rounded-xl border border-line bg-surface px-4 py-3 text-sm font-medium focus:border-pulse-700 focus:ring-2 focus:ring-pulse-700 ${
+                        accountRole === option.value
+                          ? 'bg-pulse-50 text-pulse-800 border-pulse-700'
+                          : 'text-ink-muted hover:bg-surface-muted hover:text-ink'
+                      }`}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-xs text-ink-muted">
+                  Your account role is a personal preference and does not grant
+                  any circle permissions or administrative access.
+                </p>
               </div>
 
               {error ? (

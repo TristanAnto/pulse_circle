@@ -29,6 +29,9 @@ const registerSchema = z.object({
   fullName: z.string().trim().min(1).max(100),
   email: z.string().trim().toLowerCase().email().max(254),
   password: z.string().min(8).max(128),
+  accountRole: z
+    .enum(['ELDER', 'FAMILY_MEMBER', 'NEIGHBOUR', 'GUARDIAN', 'OTHER'])
+    .optional(),
 })
 
 const loginSchema = z.object({
@@ -56,7 +59,7 @@ router.post('/register', authLimiter, async (req, res) => {
     return
   }
 
-  const { fullName, email, password } = result.data
+  const { fullName, email, password, accountRole } = result.data
   const normalizedEmail = email.toLowerCase()
 
   const existing = await prisma.user.findUnique({
@@ -74,8 +77,9 @@ router.post('/register', authLimiter, async (req, res) => {
       fullName,
       email: normalizedEmail,
       passwordHash,
+      accountRole,
     },
-    select: { id: true, email: true, fullName: true },
+    select: { id: true, email: true, fullName: true, accountRole: true },
   })
 
   const token = signToken({ userId: user.id, email: user.email })
@@ -97,7 +101,7 @@ router.post('/login', authLimiter, async (req, res) => {
 
   const user = await prisma.user.findUnique({
     where: { email: normalizedEmail },
-    select: { id: true, email: true, fullName: true, passwordHash: true },
+    select: { id: true, email: true, fullName: true, passwordHash: true, accountRole: true },
   })
 
   if (!user || !user.passwordHash) {
@@ -135,7 +139,7 @@ router.post('/logout', authenticate, csrfProtection, (_req, res) => {
 router.get('/me', authenticate, async (req: AuthenticatedRequest, res) => {
   const user = await prisma.user.findUnique({
     where: { id: req.user!.userId },
-    select: { id: true, email: true, fullName: true },
+    select: { id: true, email: true, fullName: true, accountRole: true },
   })
 
   if (!user) {

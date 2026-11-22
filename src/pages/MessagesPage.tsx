@@ -1,4 +1,4 @@
-import { ArrowLeft, MessageSquareText, Users } from 'lucide-react'
+import { ArrowLeft, ChevronRight, MessageSquareText, Plus, Users } from 'lucide-react'
 
 import {
   GroupChannel,
@@ -12,7 +12,7 @@ import {
 
 import { Avatar } from '@/components/ui/Avatar'
 import { Button } from '@/components/ui/Button'
-import { Card, CardHeader } from '@/components/ui/Card'
+import { Card } from '@/components/ui/Card'
 import { cn } from '@/lib/cn'
 import { formatClock } from '@/lib/format'
 import {
@@ -21,23 +21,14 @@ import {
   removeMessageHandler,
   subscribeNexconnConnection,
 } from '@/lib/nexconn'
-import { api } from '@/lib/api'
+import { api, type ApiError } from '@/lib/api'
 import { useAuth } from '@/context/auth'
 import type { ChatMessage } from '@/types'
 
 import React from 'react'
 
-/**
- * A verified Nexconn recipient for direct messaging, as returned by the
- * backend's circle recipient-resolution endpoint. Nexconn user IDs are
- * never hardcoded on the frontend; they always come from this response.
- */
-type NexconnRecipient = {
-  userId: string
-  nexconnUserId: string
-  fullName: string
-  role: string
-}
+const UUID_REGEX =
+  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/
 
 /**
  * A Circle member returned by GET /api/circles/:circleId/members.
@@ -51,9 +42,6 @@ type CircleMembership = {
   role: string
   joinedAt: string
 }
-
-const UUID_REGEX =
-  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/
 
 /**
  * A real Pulse Circle returned by GET /api/circles. Only the fields the
@@ -153,16 +141,6 @@ export function MessagesPage() {
   // Derived: whether the currently selected conversation is a real Circle.
   // Computed from selectedId (a database UUID), not from the Nexconn groupId.
   const selectedIsRealCircle = !!selectedId && UUID_REGEX.test(selectedId)
-  // Verified Nexconn recipients for the currently selected real circle.
-  // Nexconn user IDs come only from the backend response — they are never
-  // hardcoded or derived client-side. State is keyed by circle id and
-  // derived in render so the effect never calls setState synchronously.
-  const [recipientMap, setRecipientMap] = React.useState<
-    Record<string, NexconnRecipient[]>
-  >({})
-  const [recipientErrorMap, setRecipientErrorMap] = React.useState<
-    Record<string, string>
-  >({})
   // Real circles for the authenticated user. Kept separate from the mock
   // demonstration conversations so the two sources never mix.
   const [circles, setCircles] = React.useState<RealCircle[] | null>(null)
@@ -178,6 +156,18 @@ export function MessagesPage() {
     null,
   )
   const [isSyncingMember, setIsSyncingMember] = React.useState(false)
+  // Circle rename state (only ELDER/ADMIN members may rename).
+  const [renameOpen, setRenameOpen] = React.useState(false)
+  const [renameName, setRenameName] = React.useState('')
+  const [renameDescription, setRenameDescription] = React.useState('')
+  const [isRenaming, setIsRenaming] = React.useState(false)
+  const [renameError, setRenameError] = React.useState<string | null>(null)
+  // Circle create state.
+  const [createCircleOpen, setCreateCircleOpen] = React.useState(false)
+  const [createCircleName, setCreateCircleName] = React.useState('')
+  const [createCircleDescription, setCreateCircleDescription] = React.useState('')
+  const [isCreatingCircle, setIsCreatingCircle] = React.useState(false)
+  const [createCircleError, setCreateCircleError] = React.useState<string | null>(null)
   // Reactive Nexconn connection state. Updated via subscribeNexconnConnection
   // so the history-loading effect can retry when connection completes
   // asynchronously after page mount.
@@ -185,11 +175,10 @@ export function MessagesPage() {
   // History loading state per circle. Tracks whether history has been loaded
   // for a given circle to prevent redundant fetches when switching between
   // conversations. Real-time messages arrive separately via onMessageReceived.
-  const [historyLoadingMap, setHistoryLoadingMap] = React.useState<Record<string, boolean>>(
-    {}
-  )
   const [historyErrorMap, setHistoryErrorMap] = React.useState<Record<string, string>>({})
   const [historyLoadedMap, setHistoryLoadedMap] = React.useState<Record<string, boolean>>({})
+  // Ref to the last rendered message element for auto-scroll-to-bottom.
+  const messagesEndRef = React.useRef<HTMLDivElement>(null)
   // Backend-authorized mapping from Nexconn groupId to Pulse Circle circleId.
   // Populated from GET /api/circles/:circleId/nexconn-channel for each of the
   // authenticated user's circles. Used to route incoming Nexconn messages to
@@ -223,9 +212,6 @@ export function MessagesPage() {
       createdAt: string
     }>
   >([])
-  const [invitationsError, setInvitationsError] = React.useState<string | null>(
-    null,
-  )
   const [isHandlingInvitation, setIsHandlingInvitation] = React.useState(false)
 
   const isMobile = React.useMemo(
@@ -286,12 +272,10 @@ export function MessagesPage() {
         }
         if (!cancelled) {
           setPendingInvitations(data.invitations)
-          setInvitationsError(null)
         }
       } catch {
         if (!cancelled) {
           setPendingInvitations([])
-          setInvitationsError('Unable to load your invitations.')
         }
       }
     })()
@@ -355,56 +339,6 @@ export function MessagesPage() {
     }
   }, [circles])
 
-  // Resolve verified Nexconn recipients for a real Pulse Circle.
-  //
-  // The selected conversation is treated as a real circle only when its id
-  // is a UUID. Mock conversation ids ('circle-group', 'priya', ...) are not
-  // UUIDs, so they fall through to the existing mock-data experience without
-  // any backend call. This keeps the prototype fully functional while the
-  // real-messaging path is opt-in.
-  React.useEffect(() => {
-    let cancelled = false
-
-    const circleId = selectedId
-    if (!circleId || !UUID_REGEX.test(circleId) || !currentUser) {
-      return () => {
-        cancelled = true
-      }
-    }
-
-    ;(async () => {
-      try {
-        const data = (await api.get(
-          `/api/circles/${circleId}/nexconn-recipients`
-        )) as { recipients: NexconnRecipient[] }
-        if (!cancelled) {
-          setRecipientMap((current) => ({ ...current, [circleId]: data.recipients }))
-          setRecipientErrorMap((current) => {
-            const next = { ...current }
-            delete next[circleId]
-            return next
-          })
-        }
-      } catch {
-        if (!cancelled) {
-          setRecipientErrorMap((current) => ({
-            ...current,
-            [circleId]: 'Unable to load message recipients for this circle.',
-          }))
-          setRecipientMap((current) => {
-            const next = { ...current }
-            delete next[circleId]
-            return next
-          })
-        }
-      }
-    })()
-
-    return () => {
-      cancelled = true
-    }
-  }, [selectedId, currentUser])
-
   // Fetch database-backed circle members for the selected real circle.
   // Uses GET /api/circles/:circleId/members which returns userId + fullName
   // from the Users table — never hardcoded personas.
@@ -460,7 +394,6 @@ export function MessagesPage() {
     let cancelled = false
 
     ;(async () => {
-      setHistoryLoadingMap((current) => ({ ...current, [selectedId]: true }))
       setHistoryErrorMap((current) => {
         const next = { ...current }
         delete next[selectedId]
@@ -476,11 +409,6 @@ export function MessagesPage() {
 
         if (!channel || channel.status !== 'CREATED' || !channel.groupId) {
           setHistoryLoadedMap((current) => ({ ...current, [selectedId]: true }))
-          setHistoryLoadingMap((current) => {
-            const next = { ...current }
-            delete next[selectedId]
-            return next
-          })
           return
         }
 
@@ -509,9 +437,11 @@ export function MessagesPage() {
           const existingIds = new Set(existing.map((m) => m.id))
           const newMessages = mapped.filter((m) => !existingIds.has(m.id))
           if (newMessages.length === 0) return current
+          const merged = [...existing, ...newMessages]
+          merged.sort((a, b) => a.sentAt < b.sentAt ? -1 : a.sentAt > b.sentAt ? 1 : 0)
           return {
             ...current,
-            [selectedId]: [...existing, ...newMessages],
+            [selectedId]: merged,
           }
         })
       } catch {
@@ -522,11 +452,6 @@ export function MessagesPage() {
       } finally {
         if (!cancelled) {
           setHistoryLoadedMap((current) => ({ ...current, [selectedId]: true }))
-          setHistoryLoadingMap((current) => {
-            const next = { ...current }
-            delete next[selectedId]
-            return next
-          })
         }
       }
     })()
@@ -538,6 +463,15 @@ export function MessagesPage() {
   // connection transitions to true after page mount, enabling automatic
   // history loading after browser reload.
   }, [selectedId, selectedIsRealCircle, currentUser, nexconnConnected, historyLoadedMap])
+
+  // Auto-scroll to the bottom whenever the conversation or message list
+  // changes. Covers: initial history load, incoming real-time messages,
+  // and outgoing sends. The dependency is a count (stable by value), not
+  // an array reference, so it only fires when the list actually changes.
+  const currentMessageCount = selectedId ? messagesByConversation[selectedId]?.length ?? 0 : 0
+  React.useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+  }, [selectedId, currentMessageCount])
   // AuthContext owns connect/disconnect; this page only subscribes to
   // connection state and registers its message handler.
   const appendIncoming = React.useCallback(
@@ -562,9 +496,11 @@ export function MessagesPage() {
         if (existing.some((entry) => entry.id === chatMessage.id)) {
           return current
         }
+        const merged = [...existing, chatMessage]
+        merged.sort((a, b) => a.sentAt < b.sentAt ? -1 : a.sentAt > b.sentAt ? 1 : 0)
         return {
           ...current,
-          [targetId]: [...existing, chatMessage],
+          [targetId]: merged,
         }
       })
     },
@@ -614,10 +550,6 @@ export function MessagesPage() {
   // Derived recipient state for the currently selected real circle. These
   // are computed in render (never inside an effect) so the effect never has
   // to call setState synchronously.
-  const recipients = selectedId ? recipientMap[selectedId] : undefined
-  const recipientsError = selectedId ? recipientErrorMap[selectedId] : undefined
-  const recipientsLoading = selectedIsRealCircle && !recipients && !recipientsError
-
   const selectConversation = (id: string) => {
     setSelectedId(id)
     setView('conversation')
@@ -665,17 +597,86 @@ export function MessagesPage() {
       direction: 'outgoing',
     }
 
-    setMessagesByConversation((current) => ({
-      ...current,
-      [selectedId]: [...(current[selectedId] ?? []), optimisticMessage],
-    }))
+    setMessagesByConversation((current) => {
+      const merged = [...(current[selectedId] ?? []), optimisticMessage]
+      merged.sort((a, b) => a.sentAt < b.sentAt ? -1 : a.sentAt > b.sentAt ? 1 : 0)
+      return {
+        ...current,
+        [selectedId]: merged,
+      }
+    })
 
     try {
-      const channel = (await api.get(
-        `/api/circles/${selectedId}/nexconn-channel`
-      )) as { circleId: string; groupId: string; status: string }
+      let channel: { circleId: string; groupId: string; status: string } | null = null
 
-      if (!channel || channel.status !== 'CREATED' || !channel.groupId) {
+      const tryCreateChannel = async (): Promise<{ circleId: string; groupId: string; status: string } | null> => {
+        try {
+          await api.post(`/api/circles/${selectedId}/nexconn-channel`)
+        } catch (postErr) {
+          const postErrObj = postErr as ApiError
+          if (postErrObj.status === 409) {
+            setMessagesByConversation((current) => ({
+              ...current,
+              [selectedId]: (current[selectedId] ?? []).filter(
+                (m) => m.id !== optimisticId
+              ),
+            }))
+            setSendError(
+              'A channel creation is already in progress for this circle. Please try again shortly.'
+            )
+            return null
+          }
+          setMessagesByConversation((current) => ({
+            ...current,
+            [selectedId]: (current[selectedId] ?? []).filter(
+              (m) => m.id !== optimisticId
+            ),
+          }))
+          setSendError('Failed to create chat channel. Please try again.')
+          return null
+        }
+
+        return (await api.get(
+          `/api/circles/${selectedId}/nexconn-channel`
+        )) as { circleId: string; groupId: string; status: string }
+      }
+
+      const isSendReadyStatus = (status: string): boolean => {
+        return status === 'CREATED' || status === 'SYNCED' || status === 'PARTIAL'
+      }
+
+      try {
+        channel = (await api.get(
+          `/api/circles/${selectedId}/nexconn-channel`
+        )) as { circleId: string; groupId: string; status: string }
+      } catch (err) {
+        const getErr = err as ApiError
+        if (getErr.status === 404) {
+          channel = await tryCreateChannel()
+        } else {
+          setMessagesByConversation((current) => ({
+            ...current,
+            [selectedId]: (current[selectedId] ?? []).filter(
+              (m) => m.id !== optimisticId
+            ),
+          }))
+          setSendError(
+            getErr.message ?? 'Failed to load chat channel. Please try again.'
+          )
+          return
+        }
+      }
+
+      if (!channel) {
+        return
+      }
+
+      // Recover PENDING or FAILED channel by calling POST to resume creation.
+      if (channel.status === 'PENDING' || channel.status === 'FAILED') {
+        channel = await tryCreateChannel()
+      }
+
+      if (!channel || !isSendReadyStatus(channel.status) || !channel.groupId) {
         setMessagesByConversation((current) => ({
           ...current,
           [selectedId]: (current[selectedId] ?? []).filter(
@@ -735,6 +736,109 @@ export function MessagesPage() {
     }
   }
 
+  const handleRenameSubmit = async (event: React.FormEvent): Promise<void> => {
+    event.preventDefault()
+    if (!selectedId || !selectedCircle) return
+
+    setRenameError(null)
+    setIsRenaming(true)
+
+    const name = renameName.trim()
+    const description = renameDescription.trim() || null
+
+    if (!name) {
+      setRenameError('Circle name is required.')
+      setIsRenaming(false)
+      return
+    }
+
+    try {
+      const data = (await api.patch(
+        `/api/circles/${selectedId}`,
+        { name, description },
+      )) as { id: string; name: string; description: string | null }
+
+      // Update local circle state so the display reflects the new name
+      // immediately and remains correct after refresh or re-selection.
+      setCircles((current) => {
+        if (!current) return current
+        return current.map((circle) =>
+          circle.id === selectedId
+            ? { ...circle, name: data.name, description: data.description }
+            : circle,
+        )
+      })
+
+      setRenameOpen(false)
+      setRenameName('')
+      setRenameDescription('')
+    } catch (err) {
+      setRenameError(
+        (err as Error).message ?? 'Failed to rename circle. Please try again.',
+      )
+    } finally {
+      setIsRenaming(false)
+    }
+  }
+
+  const handleCreateCircle = async (event: React.FormEvent): Promise<void> => {
+    event.preventDefault()
+    setCreateCircleError(null)
+    setIsCreatingCircle(true)
+
+    const name = createCircleName.trim()
+    const description = createCircleDescription.trim() || undefined
+
+    if (!name) {
+      setCreateCircleError('Circle name is required.')
+      setIsCreatingCircle(false)
+      return
+    }
+
+    try {
+      const data = (await api.post('/api/circles/', {
+        name,
+        description,
+      })) as {
+        circle: {
+          id: string
+          name: string
+          description: string | null
+          createdAt: string
+          updatedAt: string
+        }
+        membership: { circleId: string; userId: string; role: string }
+      }
+
+      const newCircle: RealCircle = {
+        id: data.circle.id,
+        name: data.circle.name,
+        description: data.circle.description,
+        createdAt: data.circle.createdAt,
+        updatedAt: data.circle.updatedAt,
+        role: data.membership.role,
+      }
+
+      setCircles((current) => {
+        if (!current) return [newCircle]
+        return [...current, newCircle]
+      })
+
+      setSelectedId(data.circle.id)
+      setView('conversation')
+
+      setCreateCircleOpen(false)
+      setCreateCircleName('')
+      setCreateCircleDescription('')
+    } catch (err) {
+      setCreateCircleError(
+        (err as Error).message ?? 'Failed to create circle. Please try again.',
+      )
+    } finally {
+      setIsCreatingCircle(false)
+    }
+  }
+
   const handleInviteSubmit = async (event: React.FormEvent): Promise<void> => {
     event.preventDefault()
     const email = inviteEmail.trim().toLowerCase()
@@ -774,13 +878,10 @@ export function MessagesPage() {
       setPendingInvitations((current) =>
         current.filter((inv) => inv.id !== invitationId),
       )
-      setInvitationsError(null)
       // Refresh circles so the newly joined circle appears.
       setCirclesRetry((n) => n + 1)
-    } catch (err) {
-      setInvitationsError(
-        (err as Error).message ?? 'Failed to accept invitation. Please try again.',
-      )
+    } catch {
+      // Intentionally empty — invitation errors are not surfaced in this view.
     } finally {
       setIsHandlingInvitation(false)
     }
@@ -793,101 +894,121 @@ export function MessagesPage() {
       setPendingInvitations((current) =>
         current.filter((inv) => inv.id !== invitationId),
       )
-      setInvitationsError(null)
-    } catch (err) {
-      setInvitationsError(
-        (err as Error).message ?? 'Failed to decline invitation. Please try again.',
-      )
+    } catch {
+      // Intentionally empty — invitation errors are not surfaced in this view.
     } finally {
       setIsHandlingInvitation(false)
     }
   }
-
   return (
-    <section aria-labelledby="messages-heading">
-      <h2 id="messages-heading" className="sr-only">Messages</h2>
+    <section aria-labelledby="messages-heading" className="space-y-5">
+      <h2 id="messages-heading" className="text-2xl font-semibold tracking-tight">
+        Messages
+      </h2>
 
-      <div className="grid gap-5 lg:grid-cols-2">
+      <div className="flex flex-col gap-5 lg:flex-row lg:gap-5 min-h-[600px]">
+        {/* Left: Circle sidebar */}
         {!isMobile || view === 'list' ? (
-          <Card>
-            <CardHeader
-              title="Your circle"
-              description={
-                selectedId && selectedCircle
-                  ? selectedCircle.description ?? ''
-                  : 'Pick a conversation to read messages.'
-              }
-              icon={<Users className="size-5" />}
-            />
-            <ul className="divide-y divide-line">
-              {/* Real circles from the authenticated user's membership. */}
-              {circlesError && (
-                <li className="px-5 py-3 text-center">
-                  <p className="text-sm text-amber-700">{circlesError}</p>
-                  <button
-                    type="button"
-                    onClick={() => setCirclesRetry((n) => n + 1)}
-                    className="mt-1 text-xs font-semibold text-pulse-700 hover:underline"
-                  >
-                    Retry
-                  </button>
-                </li>
-              )}
-              {circlesError === null && circles === null && (
-                <li className="px-5 py-3 text-center">
-                  <p className="text-sm text-ink-muted">Loading your circles…</p>
-                </li>
-              )}
-              {circles !== null &&
-                circles.map((circle) => (
-                  <li key={circle.id}>
+          <div className="flex flex-col gap-4 min-w-[280px] lg:w-[360px]">
+            <Card className="flex flex-col h-full">
+              <div className="border-b border-line px-5 py-4 sm:px-6 flex flex-row items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <Users className="size-5 text-pulse-700" aria-hidden="true" />
+                  <div>
+                    <h3 className="text-lg font-semibold tracking-tight">
+                      Your circles
+                    </h3>
+                    <p className="text-xs text-ink-muted">
+                      {circles?.length ?? 0} circle{
+                        circles?.length === 1 ? '' : 's'
+                      }
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => {
+                    setCreateCircleName('')
+                    setCreateCircleDescription('')
+                    setCreateCircleError(null)
+                    setCreateCircleOpen(true)
+                  }}
+                  className="flex items-center gap-2 min-h-10 rounded-xl px-4 py-2 text-sm font-bold text-white bg-pulse-700 shadow-sm hover:bg-pulse-800 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pulse-700 focus-visible:ring-offset-2"
+                >
+                  <Plus aria-hidden="true" className="size-4" />
+                  Create circle
+                </button>
+              </div>
+
+              <div className="flex-1 overflow-y-auto divide-y divide-line px-4 py-3 sm:px-5">
+                {circlesError && (
+                  <div className="px-4 py-4 text-center">
+                    <p className="text-sm text-amber-700">{circlesError}</p>
                     <button
-                      onClick={() => selectConversation(circle.id)}
-                      className="w-full flex items-center gap-3 rounded-xl px-4 py-3 text-left hover:bg-surface-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pulse-700"
+                      type="button"
+                      onClick={() => setCirclesRetry((n) => n + 1)}
+                      className="mt-1 text-xs font-semibold text-pulse-700 hover:underline"
                     >
-                      <div className="relative">
-                        <Avatar name={circle.name} tone="pulse" />
-                      </div>
-                      <div className="min-w-0 flex-1">
-                        <p className="font-semibold truncate">{circle.name}</p>
-                        <p className="truncate text-sm text-ink-muted">
-                          {circle.description ?? 'No description'}
-                          {' · '}
-                          <span className="text-[11px] uppercase tracking-wide">
-                            {circleRoleLabel(circle.role)}
-                          </span>
-                        </p>
-                      </div>
-                      <span className="ml-auto text-[11px] font-semibold text-ink-muted">
-                        Real
-                      </span>
+                      Retry
                     </button>
-                  </li>
-                ))}
-              {circles !== null && circles.length === 0 && circlesError === null && (
-                <li className="px-5 py-4 sm:px-6 text-center">
-                  <p className="text-sm text-ink-muted">
-                    You are not a member of any circles yet.
-                  </p>
-                </li>
-              )}
-              {/* Pending invitations received by the authenticated user. */}
-              {invitationsError && (
-                <li className="px-5 py-3 text-center">
-                  <p className="text-sm text-amber-700">{invitationsError}</p>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setCirclesRetry((n) => n + 1)
-                    }}
-                    className="mt-1 text-xs font-semibold text-pulse-700 hover:underline"
-                  >
-                    Retry
-                  </button>
-                </li>
-              )}
+                  </div>
+                )}
+                {circlesError === null && circles === null && (
+                  <div className="px-4 py-4 text-center">
+                    <p className="text-sm text-ink-muted">Loading your circles…</p>
+                  </div>
+                )}
+                {circles !== null &&
+                  circles.map((circle) => {
+                    const isSelected = selectedId === circle.id
+                    return (
+                      <button
+                        key={circle.id}
+                        onClick={() => selectConversation(circle.id)}
+                        className={cn(
+                          'flex items-center gap-3 rounded-xl px-4 py-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2',
+                          isSelected
+                            ? 'bg-pulse-50 text-pulse-800 border border-pulse-100'
+                            : 'bg-surface text-ink hover:bg-surface-muted',
+                          'focus-visible:ring-pulse-700',
+                        )}
+                      >
+                        <div className="relative shrink-0">
+                          <Avatar name={circle.name} tone="pulse" />
+                          {isSelected && (
+                            <div className="absolute -right-1 -bottom-1 flex size-2.5 items-center justify-center rounded-full bg-pulse-700 text-white ring-2 ring-surface">
+                              <span className="text-[10px] font-bold">•</span>
+                            </div>
+                          )}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <p className="font-semibold truncate text-sm">
+                            {circle.name}
+                          </p>
+                          <p className="truncate text-[11px] text-ink-muted">
+                            {circle.description ?? 'No description'}
+                            {' · '}
+                            <span className="uppercase tracking-wide">
+                              {circleRoleLabel(circle.role)}
+                            </span>
+                          </p>
+                        </div>
+                        <span className="text-[10px] font-semibold text-ink-muted">
+                          Real
+                        </span>
+                      </button>
+                    )
+                  })}
+                {circles !== null && circles.length === 0 && circlesError === null && (
+                  <div className="px-4 py-6 text-center">
+                    <p className="text-sm text-ink-muted">
+                      You are not a member of any circles yet.
+                    </p>
+                  </div>
+                )}
+              </div>
+
               {pendingInvitations.length > 0 && (
-                <li className="px-5 py-4 sm:px-6">
+                <div className="border-t border-line px-5 py-4 sm:px-6">
                   <p className="text-xs font-semibold text-ink-muted mb-3">
                     Pending invitations
                   </p>
@@ -939,219 +1060,479 @@ export function MessagesPage() {
                       </li>
                     ))}
                   </ul>
-                </li>
+                </div>
               )}
-            </ul>
-          </Card>
+            </Card>
+          </div>
         ) : null}
 
+        {/* Right: Conversation area */}
         {selectedId && selectedConversation && (
-          <Card className="flex flex-col min-w-0">
-            <div className="border-b border-line px-5 py-4 sm:px-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
-              <div>
-                <button
-                  onClick={goBack}
-                  className="lg:hidden inline-flex min-h-10 items-center gap-2 rounded-lg px-3 text-sm font-semibold text-pulse-800 hover:bg-pulse-50"
-                >
-                  <ArrowLeft aria-hidden="true" className="size-4" />
-                  Back
-                </button>
-                <h2 className="text-lg font-semibold">{selectedConversation.title}</h2>
-                <p className="text-sm text-ink-muted">{selectedConversation.subtitle}</p>
+          <div className="flex-1 flex flex-col min-w-0">
+            {/* Conversation header */}
+            <Card className="flex flex-col h-full">
+              <div className="border-b border-line px-5 py-4 sm:px-6 flex flex-row items-center justify-between gap-3">
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={goBack}
+                    className="lg:hidden shrink-0 inline-flex min-h-10 items-center gap-2 rounded-lg px-3 text-sm font-semibold text-pulse-800 hover:bg-pulse-50"
+                  >
+                    <ArrowLeft aria-hidden="true" className="size-4" />
+                    Back
+                  </button>
+                  <div className="relative shrink-0">
+                    <Avatar name={selectedCircle!.name} tone="pulse" size="md" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <h2 className="text-lg font-semibold tracking-tight truncate">
+                      {selectedConversation.title}
+                    </h2>
+                    <div className="flex items-center gap-1.5 mt-0.5">
+                      <span className="text-[11px] font-semibold text-ink-muted">
+                        {circleMembersMap[selectedId]?.length ?? 0} members
+                      </span>
+                      {selectedIsRealCircle && selectedCircle &&
+                        (selectedCircle.role === 'ELDER' ||
+                          selectedCircle.role === 'ADMIN') && (
+                          <button
+                            onClick={() => {
+                              setRenameName(selectedCircle.name)
+                              setRenameDescription(selectedCircle.description ?? '')
+                              setRenameError(null)
+                              setRenameOpen(true)
+                            }}
+                            className="flex items-center gap-1 min-h-8 rounded-lg px-2 py-1 text-[11px] font-semibold text-pulse-800 hover:bg-pulse-50"
+                          >
+                            Edit
+                          </button>
+                        )}
+                    </div>
+                    <p className="text-[11px] text-ink-muted truncate">
+                      {selectedConversation.subtitle}
+                    </p>
+                  </div>
+                </div>
               </div>
-            </div>
 
-            {selectedIsRealCircle ? (
-              <div
-                className={
-                  recipientsError
-                    ? 'bg-amber-50 text-amber-800 text-xs px-5 py-2'
-                    : recipientsLoading
-                      ? 'bg-surface-muted text-ink-muted text-xs px-5 py-2'
-                      : recipients
-                        ? 'bg-mint-50 text-mint-800 text-xs px-5 py-2'
-                        : 'bg-surface-muted text-ink-muted text-xs px-5 py-2'
-                }
-              >
-                {recipientsError
-                  ? recipientsError
-                  : recipientsLoading
-                    ? 'Loading verified recipients…'
-                    : recipients
-                      ? `${recipients.length} verified recipient${
-                          recipients.length === 1 ? '' : 's'
-                        } for real messaging.`
-                      : 'No verified recipients available for this circle yet.'}
-              </div>
-            ) : null}
+              {/* Circle management panel (compact, collapsible sections) */}
+              {selectedIsRealCircle ? (
+                <div className="border-b border-line bg-surface/50 px-5 py-3 sm:px-6">
+                  <div className="grid gap-2 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3">
+                    <div className="rounded-xl border border-line bg-surface px-3 py-3">
+                      <p className="text-[11px] font-semibold text-ink-muted mb-2">
+                        Members
+                      </p>
+                      <ul className="space-y-1">
+                        {(circleMembersMap[selectedId] ?? []).map((member) => (
+                          <li
+                            key={member.userId}
+                            className="flex items-center justify-between px-2 py-1.5 rounded-lg hover:bg-pulse-50/50"
+                          >
+                            <div className="flex items-center gap-2 min-w-0">
+                              <span className="truncate text-sm text-ink">
+                                {member.fullName}
+                              </span>
+                            </div>
+                            <span className="text-[10px] font-semibold text-ink-muted">
+                              {member.role === 'ELDER'
+                                ? 'Elder'
+                                : member.role === 'NEIGHBOR'
+                                  ? 'Neighbour'
+                                  : member.role === 'FAMILY'
+                                    ? 'Family'
+                                    : member.role}
+                            </span>
+                          </li>
+                        ))}
+                        {(circleMembersMap[selectedId] ?? []).length === 0 && (
+                          <li className="px-2 py-1.5 text-[11px] text-ink-muted">
+                            Loading members…
+                          </li>
+                        )}
+                      </ul>
+                    </div>
 
-            {selectedIsRealCircle && selectedId ? (
-              <div
-                className={
-                  historyErrorMap[selectedId]
-                    ? 'bg-amber-50 text-amber-800 text-xs px-5 py-2'
-                    : historyLoadingMap[selectedId]
-                      ? 'bg-surface-muted text-ink-muted text-xs px-5 py-2'
-                      : 'bg-surface-muted text-ink-muted text-xs px-5 py-2'
-                }
-              >
-                {historyErrorMap[selectedId]
-                  ? historyErrorMap[selectedId]
-                  : historyLoadingMap[selectedId]
-                    ? 'Loading message history…'
-                    : historyLoadedMap[selectedId]
-                      ? 'Message history loaded.'
-                      : ''}
-              </div>
-            ) : null}
+                    {selectedCircle &&
+                    (selectedCircle.role === 'ELDER' ||
+                      selectedCircle.role === 'ADMIN') ? (
+                      <div className="rounded-xl border border-line bg-surface px-3 py-3">
+                        <p className="text-[11px] font-semibold text-ink-muted mb-2">
+                          Invite member
+                        </p>
+                        <form
+                          onSubmit={handleInviteSubmit}
+                          className="flex flex-col gap-2"
+                        >
+                          <input
+                            value={inviteEmail}
+                            onChange={(event) => setInviteEmail(event.target.value)}
+                            placeholder="Email address"
+                            type="email"
+                            autoComplete="email"
+                            disabled={isInviting}
+                            className="min-h-10 rounded-lg border border-line bg-surface px-3 py-2 text-sm focus:border-pulse-700 focus:ring-2 focus:ring-pulse-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                          />
+                          <Button
+                            type="submit"
+                            size="sm"
+                            disabled={isInviting || !inviteEmail.trim()}
+                            className="w-full min-h-10"
+                          >
+                            {isInviting ? 'Inviting…' : 'Invite'}
+                          </Button>
+                          {inviteError && (
+                            <p className="mt-1 text-[11px] text-danger">
+                              {inviteError}
+                            </p>
+                          )}
+                          {inviteSuccess && (
+                            <p className="mt-1 text-[11px] text-success">
+                              Invitation sent. The recipient can accept via their email link.
+                            </p>
+                          )}
+                        </form>
+                      </div>
+                    ) : null}
 
-            {selectedIsRealCircle && selectedId ? (
-              <div className="bg-surface-muted text-xs px-5 py-3 border-b border-line">
-                <p className="font-semibold mb-1">Members</p>
-                <ul className="space-y-1">
-                  {(circleMembersMap[selectedId] ?? []).map((member) => (
-                    <li key={member.userId} className="flex items-center justify-between">
-                      <span className="text-ink">{member.fullName}</span>
-                      <span className="text-ink-muted">{member.role}</span>
-                    </li>
-                  ))}
-                  {(circleMembersMap[selectedId] ?? []).length === 0 && (
-                    <li className="text-ink-muted">Loading members…</li>
-                  )}
-                </ul>
-              </div>
-            ) : null}
+                    <div className="rounded-xl border border-line bg-surface px-3 py-3">
+                      <p className="text-[11px] font-semibold text-ink-muted mb-2">
+                        Chat connection
+                      </p>
+                      <Button
+                        onClick={handleSyncMember}
+                        size="sm"
+                        disabled={isSyncingMember}
+                        className="w-full min-h-10 text-[11px]"
+                      >
+                        {isSyncingMember
+                          ? 'Syncing…'
+                          : syncMemberSuccess === 'added'
+                            ? 'Synced'
+                            : syncMemberSuccess === 'already-member'
+                              ? 'Already synced'
+                              : 'Recover membership'}
+                      </Button>
+                      {syncMemberError && (
+                        <p className="mt-1 text-[11px] text-danger">
+                          {syncMemberError}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ) : null}
 
-            {selectedIsRealCircle && selectedId ? (
-              <div className="bg-surface-muted text-xs px-5 py-3 border-b border-line">
-                <p className="font-semibold mb-1">Chat membership recovery</p>
-                <p className="text-[11px] text-ink-muted mb-3">
-                  Sync your own Nexconn identity into this circle's chat
-                  channel so you can receive messages.
-                </p>
-                <Button
-                  onClick={handleSyncMember}
-                  size="sm"
-                  disabled={isSyncingMember}
-                  className="w-full"
-                >
-                  {isSyncingMember
-                    ? 'Syncing…'
-                    : syncMemberSuccess === 'added'
-                      ? 'Synced'
-                      : syncMemberSuccess === 'already-member'
-                        ? 'Already synced'
-                        : 'Recover chat membership'}
-                </Button>
-                {syncMemberError && (
-                  <p className="mt-2 text-[11px] text-danger">{syncMemberError}</p>
+              {/* Message history area */}
+              <div className="flex-1 overflow-y-auto p-4 space-y-4 sm:p-6 lg:p-8">
+                {messages.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center h-full text-center">
+                    <MessageSquareText
+                      className="size-16 text-line mb-4"
+                      aria-hidden="true"
+                    />
+                    <h3 className="text-lg font-semibold text-ink">
+                      No messages yet
+                    </h3>
+                    <p className="mt-1 text-sm text-ink-muted max-w-xs mx-auto">
+                      {selectedIsRealCircle
+                        ? 'Incoming messages will appear here once the chat service is connected.'
+                        : 'Send the first message to start the conversation.'}
+                    </p>
+                    {historyErrorMap[selectedId] && (
+                      <div className="mt-4 rounded-lg border border-amber-100 bg-amber-50 px-3 py-2 text-left">
+                        <p className="text-[11px] font-semibold text-amber-800">
+                          Unable to load message history.
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <>
+                    {messages.map((message, index) => (
+                      <div
+                        key={message.id}
+                        ref={index === messages.length - 1 ? messagesEndRef : undefined}
+                        className={cn(
+                          'flex flex-col max-w-[85%]',
+                          message.direction === 'outgoing' ? 'ml-auto' : 'mr-auto',
+                        )}
+                      >
+                        {message.direction === 'incoming' && (
+                          <p className="text-[11px] font-semibold text-ink-muted mb-1">
+                            {message.authorName}
+                          </p>
+                        )}
+                        <div
+                          className={cn(
+                            'rounded-xl px-4 py-2.5 text-sm leading-relaxed',
+                            message.direction === 'outgoing'
+                              ? 'text-white bg-pulse-600 rounded-tr-none shadow-sm'
+                              : 'text-ink bg-surface-muted rounded-tl-none',
+                          )}
+                        >
+                          <p>{message.body}</p>
+                          <p className="mt-1 text-[10px] opacity-60">
+                            {formatClock(message.sentAt)}
+                          </p>
+                        </div>
+                      </div>
+                    ))}
+                  </>
                 )}
               </div>
-            ) : null}
 
-            {selectedIsRealCircle && selectedId && selectedCircle &&
-              (selectedCircle.role === 'ELDER' || selectedCircle.role === 'ADMIN') ? (
-              <div className="bg-surface-muted text-xs px-5 py-3 border-b border-line">
-                <p className="font-semibold mb-1">Invite member</p>
-                <form onSubmit={handleInviteSubmit} className="space-y-2">
+              {sendError && (
+                <div className="mb-3 p-3 rounded-lg border border-line bg-danger-soft text-danger text-[11px] px-5">
+                  {sendError}
+                </div>
+              )}
+
+              {/* Message composer */}
+              <form
+                onSubmit={handleSend}
+                className="border-t border-line p-4 sm:px-6"
+              >
+                <div className="flex gap-2">
                   <input
-                    value={inviteEmail}
-                    onChange={(event) => setInviteEmail(event.target.value)}
-                    placeholder="Email address"
-                    type="email"
-                    autoComplete="email"
-                    disabled={isInviting}
-                    className="min-h-12 w-full rounded-xl border border-line bg-surface px-4 py-3 text-base focus:border-pulse-700 focus:ring-2 focus:ring-pulse-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                    value={draft}
+                    onChange={(event) => setDraft(event.target.value)}
+                    placeholder="Type a message…"
+                    disabled={sending}
+                    className="flex-1 min-h-12 rounded-xl border border-line bg-surface px-4 py-3 text-base focus:border-pulse-700 focus:ring-2 focus:ring-pulse-700 disabled:opacity-50 disabled:cursor-not-allowed"
                   />
                   <Button
                     type="submit"
-                    size="sm"
-                    disabled={isInviting || !inviteEmail.trim()}
-                    className="w-full"
+                    size="lg"
+                    disabled={sending || !draft.trim()}
+                    className="min-h-12 rounded-xl px-6 text-base font-bold text-white bg-pulse-700 hover:bg-pulse-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                   >
-                    {isInviting ? 'Inviting…' : 'Invite'}
+                    Send
+                    <MessageSquareText aria-hidden="true" className="ml-2 size-4" />
                   </Button>
-                  {inviteError && (
-                    <p className="text-[11px] text-danger">{inviteError}</p>
-                  )}
-                  {inviteSuccess && (
-                    <p className="text-[11px] text-success">
-                      Invitation sent. The recipient can accept via their email link.
-                    </p>
-                  )}
-                </form>
-              </div>
-            ) : null}
-
-            <div className="flex-1 overflow-y-auto p-4 space-y-4 sm:p-6 lg:p-8">
-              {messages.length === 0 ? (
-                <p className="text-center text-lg text-ink-muted">
-                  {selectedIsRealCircle
-                    ? 'No messages yet. Incoming messages will appear here once the chat service is connected.'
-                    : 'No messages yet. Send the first one.'}
+                </div>
+                <p className="mt-2 text-[11px] text-ink-muted">
+                  Sent via Nexconn. Incoming messages will appear here as they arrive.
                 </p>
-              ) : (
-                messages.map((message) => (
-                  <div
-                    key={message.id}
-                    className={cn(
-                      'max-w-[80%] rounded-xl px-4 py-2 text-sm',
-                      message.direction === 'outgoing'
-                        ? 'ml-auto text-white bg-pulse-600'
-                        : 'text-ink bg-surface-muted',
-                      message.direction === 'outgoing'
-                        ? 'rounded-tr-none'
-                        : 'rounded-tl-none'
-                    )}
-                  >
-                    <p>{message.body}</p>
-                    <p className="mt-1 text-[11px] opacity-70">
-                      {formatClock(message.sentAt)}
-                    </p>
-                  </div>
-                ))
-              )}
-            </div>
-
-            {sendError && (
-              <div className="mb-2 p-3 rounded-lg border border-line bg-danger-soft text-danger text-xs">
-                {sendError}
-              </div>
-            )}
-
-            <form
-              onSubmit={handleSend}
-              className="border-t border-line p-4 sm:px-6"
-            >
-              <div className="flex gap-2">
-                <input
-                  value={draft}
-                  onChange={(event) => setDraft(event.target.value)}
-                  placeholder="Type a message…"
-                  disabled={sending}
-                  className="flex-1 min-h-12 rounded-xl border border-line bg-surface px-4 py-3 text-base focus:border-pulse-700 focus:ring-2 focus:ring-pulse-700 disabled:opacity-50 disabled:cursor-not-allowed"
-                />
-                <Button
-                  type="submit"
-                  size="lg"
-                  disabled={sending || !draft.trim()}
-                  className="hidden sm:inline-flex"
-                >
-                  Send
-                  <MessageSquareText aria-hidden="true" className="ml-2 size-4" />
-                </Button>
-              </div>
-              <p className="mt-2 text-[11px] text-ink-muted">
-                Sent via Nexconn. Incoming messages will appear here as they arrive.
-              </p>
-            </form>
-          </Card>
+              </form>
+            </Card>
+          </div>
         )}
       </div>
 
-      <div className="mt-4 border-t border-line pt-3 text-xs text-ink-muted text-center">
-        Real messaging — messages are sent through Nexconn group channels.
-      </div>
+      {/* Create Circle Modal */}
+      {createCircleOpen && (
+        <>
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="create-circle-heading"
+          >
+            <div
+              className="fixed inset-0 bg-black/40 backdrop-blur-sm transition-opacity"
+              onClick={() => {
+                setCreateCircleOpen(false)
+                setCreateCircleName('')
+                setCreateCircleDescription('')
+                setCreateCircleError(null)
+              }}
+              aria-hidden="true"
+            />
+            <div
+              className={cn(
+                'relative z-10 w-full max-w-md mx-4 sm:mx-0 lg:max-w-lg',
+                'bg-surface rounded-2xl border border-line shadow-raised',
+              )}
+            >
+              <div className="px-6 py-5 sm:px-8">
+                <h2
+                  id="create-circle-heading"
+                  className="text-xl font-semibold tracking-tight text-ink"
+                >
+                  Create a Circle
+                </h2>
+                <p className="mt-2 text-sm text-ink-muted">
+                  Create a new circle to stay connected with trusted neighbours
+                  and family.
+                </p>
+
+                <form
+                  onSubmit={handleCreateCircle}
+                  className="mt-6 space-y-4"
+                  noValidate
+                >
+                  <div className="space-y-2">
+                    <label htmlFor="create-circle-name" className="block text-sm font-semibold text-ink">
+                      Circle name
+                    </label>
+                    <input
+                      id="create-circle-name"
+                      value={createCircleName}
+                      onChange={(event) =>
+                        setCreateCircleName(event.target.value)
+                      }
+                      disabled={isCreatingCircle}
+                      placeholder="e.g. Family Circle"
+                      className="min-h-12 w-full rounded-xl border border-line bg-surface px-4 py-3 text-sm focus:border-pulse-700 focus:ring-2 focus:ring-pulse-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <label
+                      htmlFor="create-circle-description"
+                      className="block text-sm font-semibold text-ink"
+                    >
+                      Description
+                    </label>
+                    <textarea
+                      id="create-circle-description"
+                      value={createCircleDescription}
+                      onChange={(event) =>
+                        setCreateCircleDescription(event.target.value)
+                      }
+                      disabled={isCreatingCircle}
+                      placeholder="Optional description of this circle"
+                      rows={3}
+                      className="min-h-[96px] w-full rounded-xl border border-line bg-surface px-4 py-3 text-sm focus:border-pulse-700 focus:ring-2 focus:ring-pulse-700 disabled:opacity-50 disabled:cursor-not-allowed resize-none"
+                    />
+                  </div>
+
+                  {createCircleError && (
+                    <p className="text-sm text-danger">{createCircleError}</p>
+                  )}
+
+                  <div className="mt-6 flex justify-end gap-3">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setCreateCircleOpen(false)
+                        setCreateCircleName('')
+                        setCreateCircleDescription('')
+                        setCreateCircleError(null)
+                      }}
+                      disabled={isCreatingCircle}
+                      className={cn(
+                        'min-h-12 rounded-xl px-5 py-2.5 text-base font-semibold text-ink-muted hover:bg-surface-muted disabled:opacity-50 disabled:cursor-not-allowed',
+                        isCreatingCircle
+                          ? 'opacity-60 cursor-not-allowed'
+                          : '',
+                      )}
+                    >
+                      Cancel
+                    </button>
+                    <Button
+                      type="submit"
+                      size="lg"
+                      disabled={isCreatingCircle || !createCircleName.trim()}
+                      className="min-h-12 rounded-xl px-6 text-base font-bold text-white bg-pulse-700 hover:bg-pulse-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {isCreatingCircle ? (
+                        <>
+                          Creating…
+                          <span className="ml-2 size-5">
+                            <ChevronRight aria-hidden="true" />
+                          </span>
+                        </>
+                      ) : (
+                        <>
+                          <Plus aria-hidden="true" className="mr-2 size-5" />
+                          Create Circle
+                        </>
+                      )}
+                    </Button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* Rename Circle Modal */}
+      {renameOpen && (
+        <form onSubmit={handleRenameSubmit} className="fixed inset-0 z-50 flex items-center justify-center p-4 sm:p-6">
+          <div
+            className="fixed inset-0 bg-black/40 backdrop-blur-sm transition-opacity"
+            onClick={() => {
+              setRenameOpen(false)
+              setRenameName('')
+              setRenameDescription('')
+              setRenameError(null)
+            }}
+            aria-hidden="true"
+          />
+          <div
+            className={cn(
+              'relative z-10 w-full max-w-md mx-4 sm:mx-0',
+              'bg-surface rounded-2xl border border-line shadow-raised',
+            )}
+          >
+            <div className="px-6 py-5 sm:px-8">
+              <h2 className="text-xl font-semibold tracking-tight text-ink">
+                Rename circle
+              </h2>
+              <p className="mt-2 text-sm text-ink-muted">
+                Update the name and description of this circle.
+              </p>
+
+              <div className="mt-6 space-y-4">
+                <div className="space-y-2">
+                  <label className="block text-sm font-semibold text-ink">
+                    Circle name
+                  </label>
+                  <input
+                    value={renameName}
+                    onChange={(event) => setRenameName(event.target.value)}
+                    disabled={isRenaming}
+                    className="min-h-12 w-full rounded-xl border border-line bg-surface px-4 py-3 text-sm focus:border-pulse-700 focus:ring-2 focus:ring-pulse-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="block text-sm font-semibold text-ink">
+                    Description
+                  </label>
+                  <input
+                    value={renameDescription}
+                    onChange={(event) => setRenameDescription(event.target.value)}
+                    disabled={isRenaming}
+                    placeholder="Optional"
+                    className="min-h-12 w-full rounded-xl border border-line bg-surface px-4 py-3 text-sm focus:border-pulse-700 focus:ring-2 focus:ring-pulse-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                  />
+                </div>
+                {renameError && (
+                  <p className="text-sm text-danger">{renameError}</p>
+                )}
+                <div className="flex justify-end gap-3">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setRenameOpen(false)
+                      setRenameName('')
+                      setRenameDescription('')
+                      setRenameError(null)
+                    }}
+                    disabled={isRenaming}
+                    className={cn(
+                      'min-h-12 rounded-xl px-5 py-2.5 text-base font-semibold text-ink-muted hover:bg-surface-muted disabled:opacity-50 disabled:cursor-not-allowed',
+                      isRenaming ? 'opacity-60 cursor-not-allowed' : '',
+                    )}
+                  >
+                    Cancel
+                  </button>
+                  <Button
+                    type="submit"
+                    size="lg"
+                    disabled={isRenaming || !renameName.trim()}
+                    className="min-h-12 rounded-xl px-6 text-base font-bold text-white bg-pulse-700 hover:bg-pulse-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {isRenaming ? 'Renaming…' : 'Rename'}
+                  </Button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </form>
+      )}
     </section>
   )
 }

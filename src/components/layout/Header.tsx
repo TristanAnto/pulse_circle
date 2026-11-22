@@ -1,4 +1,4 @@
-import { Link, NavLink, useLocation, useNavigate } from 'react-router-dom'
+import { Link, NavLink, useNavigate } from 'react-router-dom'
 import { LogOut } from 'lucide-react'
 import { useState } from 'react'
 
@@ -9,15 +9,12 @@ import { Button } from '@/components/ui/Button'
 import { useAuth } from '@/context/auth'
 import { paths } from '@/routes/paths'
 
-import { navItems, pageTitles } from './navItems'
+import { navItems } from './navItems'
 
 export function Header() {
-  const { pathname } = useLocation()
   const navigate = useNavigate()
   const { user, logout, loading } = useAuth()
   const [isLoggingOut, setIsLoggingOut] = useState(false)
-
-  const title = pageTitles[pathname] ?? 'Pulse Circle'
 
   const handleLogout = async () => {
     setIsLoggingOut(true)
@@ -31,15 +28,12 @@ export function Header() {
 
   return (
     <header className="sticky top-0 z-30 border-b border-line bg-canvas/95 backdrop-blur">
-      <div className="mx-auto flex w-full max-w-6xl flex-col px-4 pt-3 sm:px-6">
+      <div className="mx-auto flex w-full max-w-7xl flex-col px-4 pt-3 sm:px-6">
         <div className="flex items-center justify-between gap-4">
           <div className="flex min-w-0 items-center gap-3">
             <Link to={paths.dashboard}>
               <BrandMark />
             </Link>
-            <h1 className="truncate text-xl font-semibold tracking-tight">
-              {title}
-            </h1>
           </div>
 
           <nav aria-label="Primary" className="hidden md:flex items-center gap-1">

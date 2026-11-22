@@ -33,6 +33,11 @@ const createCircleSchema = z.object({
   description: z.string().trim().max(500).default(''),
 })
 
+const updateCircleSchema = z.object({
+  name: z.string().trim().min(1).max(100),
+  description: z.string().trim().max(500).optional(),
+})
+
 const invitationRateLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -319,6 +324,66 @@ router.get(
         createdAt: circle.createdAt,
         updatedAt: circle.updatedAt,
         role,
+      }
+
+      res.json(response)
+    } catch (err) {
+      next(err)
+    }
+  }
+)
+
+/**
+ * PATCH /api/circles/:circleId
+ * Renames a circle. Only ELDER or ADMIN members may rename.
+ */
+router.patch(
+  '/:circleId',
+  authenticate,
+  csrfProtection,
+  membershipRequired('circleId'),
+  roleRequired(MemberRole.ELDER, MemberRole.ADMIN),
+  async (
+    req: CircleMembershipRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
+    const result = updateCircleSchema.safeParse(req.body)
+    if (!result.success) {
+      res.status(400).json({ error: 'Invalid input' })
+      return
+    }
+
+    if (!req.user || !req.circleMembership) {
+      res.status(401).json({ error: 'Authentication required' })
+      return
+    }
+
+    const circleId = req.circleMembership.circleId
+    const { name, description } = result.data
+
+    try {
+      const circle = await prisma.circle.update({
+        where: { id: circleId },
+        data: {
+          name,
+          description: description ?? null,
+        },
+        select: {
+          id: true,
+          name: true,
+          description: true,
+          createdAt: true,
+          updatedAt: true,
+        },
+      })
+
+      const response: CircleResponse = {
+        id: circle.id,
+        name: circle.name,
+        description: circle.description,
+        createdAt: circle.createdAt,
+        updatedAt: circle.updatedAt,
       }
 
       res.json(response)
@@ -1037,7 +1102,8 @@ router.post(
       // Step 1: Lock the Circle row, then insert or preserve the placeholder
       // mapping inside a short transaction. The Circle lock serializes
       // placeholder creation with the future member-removal no-channel path.
-      const channel = await prisma.$transaction(async (tx) => {
+      const channel = await prisma.$transaction(
+        async (tx) => {
         const circleRows = await tx.$queryRawUnsafe<Array<{ id: string }>>(
           `SELECT id FROM "Circle" WHERE id = $1 FOR UPDATE`,
           circleId
@@ -1080,7 +1146,7 @@ router.post(
             creationStatus: true,
           },
         })
-      })
+      }, { maxWait: 10000, timeout: 10000 })
 
       if (!channel) {
         res.status(500).json({ error: 'Channel mapping not found' })
@@ -1115,7 +1181,8 @@ router.post(
           // Group exists externally — mark CREATED and proceed to sync.
           await updateCircleNexconnChannelFenced(circleId, ownerToken, 'CREATED', null)
         } else if (existenceCheck.code === 25410) {
-          // Group does not exist externally — proceed to creation below.
+          // RC_GROUP_ID_NOT_EXIST — the group does not exist externally.
+          // Proceed to group creation below (Step 5).
         } else {
           // Uncertain outcome — preserve state, return retryable response.
           res.status(503).json({
@@ -1489,7 +1556,7 @@ async function updateCircleNexconnChannelFenced(
     // Conditional UPDATE — re-fences at execution time using clock_timestamp().
     const result = await tx.$executeRawUnsafe(
       `UPDATE "CircleNexconnChannel"
-       SET "creationStatus" = $1,
+       SET "creationStatus" = $1::"CircleChannelStatus",
            "nexconnError" = $2,
            "updatedAt" = clock_timestamp()
        WHERE "circleId" = $3

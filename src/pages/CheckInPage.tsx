@@ -26,11 +26,12 @@ export function CheckInPage() {
 
   return (
     <section aria-labelledby="checkin-heading">
-      <h2 id="checkin-heading" className="sr-only">Daily check-in</h2>
+      <h2 id="checkin-heading" className="text-2xl font-semibold tracking-tight mb-6">
+        Daily check-in
+      </h2>
 
-      <Card className="flex flex-col gap-5 max-w-2xl mx-auto">
+      <Card className="flex flex-col gap-5 w-full lg:max-w-5xl mx-auto">
         <CardHeader
-          title="Daily check-in"
           description="One tap tells your circle you are alright."
           icon={<ClipboardCheck className="size-5" />}
           action={
@@ -108,7 +109,7 @@ export function CheckInPage() {
         )}
       </Card>
 
-      <div className="mt-4 border-t border-line pt-3 text-xs text-ink-muted text-center max-w-2xl mx-auto">
+      <div className="mt-4 border-t border-line pt-3 text-xs text-ink-muted text-center w-full lg:max-w-5xl mx-auto">
         Local demonstration state only — nothing is stored on a server.
       </div>
     </section>

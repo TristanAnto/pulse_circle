@@ -5,6 +5,7 @@ generator client {
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
 }
 
 // Pulse Circle data model.
@@ -24,6 +25,14 @@ enum MemberRole {
   FAMILY
   EMERGENCY_CONTACT
   ADMIN
+}
+
+enum AccountRole {
+  ELDER
+  FAMILY_MEMBER
+  NEIGHBOUR
+  GUARDIAN
+  OTHER
 }
 
 enum CheckInStatus {
@@ -84,6 +93,7 @@ model User {
   email        String   @unique
   passwordHash String?
   phoneNumber  String?
+  accountRole  AccountRole?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 

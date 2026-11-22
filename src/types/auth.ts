@@ -1,7 +1,10 @@
+export type AccountRole = 'ELDER' | 'FAMILY_MEMBER' | 'NEIGHBOUR' | 'GUARDIAN' | 'OTHER'
+
 export type AuthenticatedUser = {
   id: string
   email: string
   fullName: string
+  accountRole: AccountRole | null
 }
 
 export type LoginRequest = {
@@ -13,6 +16,7 @@ export type RegisterRequest = {
   fullName: string
   email: string
   password: string
+  accountRole?: AccountRole
 }
 
 export type AuthResponse = {

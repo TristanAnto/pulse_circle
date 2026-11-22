@@ -16,7 +16,7 @@ export function AppLayout() {
       <Header />
       <main
         id="main-content"
-        className="mx-auto w-full max-w-6xl px-4 pb-28 pt-6 sm:px-6 lg:pb-12"
+        className="mx-auto w-full max-w-7xl px-4 pb-28 pt-6 sm:px-6 lg:pb-12"
       >
         <Outlet />
       </main>

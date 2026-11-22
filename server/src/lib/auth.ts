@@ -14,6 +14,7 @@ export interface SafeUser {
   id: string
   email: string
   fullName: string
+  accountRole: string | null
 }
 
 /**
@@ -57,8 +58,14 @@ export function safeUser(user: {
   id: string
   email: string
   fullName: string
+  accountRole: string | null
 }): SafeUser {
-  return { id: user.id, email: user.email, fullName: user.fullName }
+  return {
+    id: user.id,
+    email: user.email,
+    fullName: user.fullName,
+    accountRole: user.accountRole,
+  }
 }
 
 /**
