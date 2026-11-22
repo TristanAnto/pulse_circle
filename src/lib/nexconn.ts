@@ -187,3 +187,16 @@ export function subscribeNexconnConnection(
     connectionListeners.delete(listener)
   }
 }
+
+/**
+ * Map a Pulse Circle user ID (UUID) to a Nexconn-compatible user ID.
+ *
+ * Nexconn user IDs are stored as 32-character hex strings (UUID hyphens
+ * stripped). This mirrors server/src/lib/nexconn.ts so the frontend can
+ * resolve Nexconn sender IDs back to Pulse Circle member records.
+ *
+ * The original Pulse Circle UUID in the database is never modified.
+ */
+export function toNexconnUserId(userId: string): string {
+  return userId.replace(/-/g, '')
+}

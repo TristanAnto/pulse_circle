@@ -89,6 +89,7 @@ type ListCircleResponse = {
   description: string | null
   createdAt: Date
   role: MemberRole
+  unreadCount: number
 }
 
 type CircleDetailResponse = {
@@ -264,12 +265,25 @@ router.get(
         orderBy: { circle: { createdAt: 'desc' } },
       })
 
+      // Fetch per-circle unread counts for the authenticated user.
+      const readStates = await prisma.conversationReadState.findMany({
+        where: { userId },
+        select: { circleId: true, unreadCount: true },
+      })
+      const unreadCountMap = new Map(
+        readStates.map(
+          (rs: { circleId: string; unreadCount: number }) =>
+            [rs.circleId, rs.unreadCount] as [string, number]
+        )
+      )
+
       const circles: ListCircleResponse[] = memberships.map((m) => ({
         id: m.circle.id,
         name: m.circle.name,
         description: m.circle.description,
         createdAt: m.circle.createdAt,
         role: m.role,
+        unreadCount: unreadCountMap.get(m.circle.id) ?? 0,
       }))
 
       res.json({ circles })
@@ -327,6 +341,107 @@ router.get(
       }
 
       res.json(response)
+    } catch (err) {
+      next(err)
+    }
+  }
+)
+
+/**
+ * POST /api/circles/:circleId/read
+ * Marks the conversation as read for the authenticated user, resetting the
+ * unread count to zero and recording the read timestamp.
+ */
+router.post(
+  '/:circleId/read',
+  authenticate,
+  csrfProtection,
+  membershipRequired('circleId'),
+  async (
+    req: CircleMembershipRequest,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> => {
+    if (!req.user || !req.circleMembership) {
+      res.status(401).json({ error: 'Authentication required' })
+      return
+    }
+
+    const circleId = req.circleMembership.circleId
+    const userId = req.user.userId
+
+    try {
+      await prisma.conversationReadState.upsert({
+        where: {
+          userId_circleId: {
+            userId,
+            circleId,
+          },
+        },
+        update: {
+          unreadCount: 0,
+          lastReadAt: new Date(),
+        },
+        create: {
+          userId,
+          circleId,
+          unreadCount: 0,
+          lastReadAt: new Date(),
+        },
+      })
+
+      res.json({ success: true })
+    } catch (err) {
+      next(err)
+    }
+  }
+)
+
+/**
+ * POST /api/circles/:circleId/messages/unread
+ * Increments the unread message count for the authenticated user's
+ * conversation with the given circle. Called by the frontend when a new
+ * incoming message arrives via Nexconn.
+ */
+router.post(
+  '/:circleId/messages/unread',
+  authenticate,
+  csrfProtection,
+  membershipRequired('circleId'),
+  async (
+    req: CircleMembershipRequest,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> => {
+    if (!req.user || !req.circleMembership) {
+      res.status(401).json({ error: 'Authentication required' })
+      return
+    }
+
+    const circleId = req.circleMembership.circleId
+    const userId = req.user.userId
+
+    try {
+      await prisma.conversationReadState.upsert({
+        where: {
+          userId_circleId: {
+            userId,
+            circleId,
+          },
+        },
+        update: {
+          unreadCount: {
+            increment: 1,
+          },
+        },
+        create: {
+          userId,
+          circleId,
+          unreadCount: 1,
+        },
+      })
+
+      res.json({ success: true })
     } catch (err) {
       next(err)
     }

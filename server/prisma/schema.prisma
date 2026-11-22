@@ -105,6 +105,7 @@ model User {
   invitationsReceived CircleInvitation[] @relation("CircleInvitationInvitee")
   removalRecordsAsTarget NexconnRemovalRecord[] @relation("RemovalTarget")
   removalRecordsAsRequester NexconnRemovalRecord[] @relation("RemovalRequester")
+  conversationReadStates ConversationReadState[]
 
   @@index([createdAt])
 }
@@ -123,6 +124,7 @@ model Circle {
   invitations    CircleInvitation[]
   nexconnChannel CircleNexconnChannel?
   removalRecords NexconnRemovalRecord[]
+  conversationReadStates ConversationReadState[]
 
   @@index([createdAt])
 }
@@ -324,4 +326,29 @@ model CircleInvitation {
   @@index([inviterId])
   @@index([inviteeEmail])
   @@index([expiresAt])
+}
+
+/**
+ * Tracks per-user, per-circle unread message state.
+ *
+ * `unreadCount` is the number of incoming (non-current-user) messages
+ * received since `lastReadAt`. The frontend increments it on real-time
+ * message arrival and resets it when the user opens the conversation.
+ * Persisted so counts survive refresh, login, and multi-device use.
+ */
+model ConversationReadState {
+  id        String   @id @default(uuid())
+  userId    String
+  circleId  String
+  unreadCount Int    @default(0)
+  lastReadAt  DateTime?
+  updatedAt   DateTime @updatedAt
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  circle Circle @relation(fields: [circleId], references: [id], onDelete: Cascade)
+
+  // One read-state row per user per circle.
+  @@unique([userId, circleId])
+  @@index([userId])
+  @@index([circleId])
 }

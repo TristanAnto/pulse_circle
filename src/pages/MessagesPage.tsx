@@ -1,4 +1,4 @@
-import { ArrowLeft, ChevronRight, MessageSquareText, Plus, Users } from 'lucide-react'
+import { ArrowLeft, ChevronDown, ChevronRight, ChevronUp, MessageSquareText, Plus, Users } from 'lucide-react'
 
 import {
   GroupChannel,
@@ -20,6 +20,7 @@ import {
   isNexconnConnected,
   removeMessageHandler,
   subscribeNexconnConnection,
+  toNexconnUserId,
 } from '@/lib/nexconn'
 import { api, type ApiError } from '@/lib/api'
 import { useAuth } from '@/context/auth'
@@ -55,6 +56,7 @@ type RealCircle = {
   createdAt: string
   updatedAt: string
   role: string
+  unreadCount: number
 }
 
 const CIRCLE_ROLE_LABELS: Record<string, string> = {
@@ -130,6 +132,28 @@ function mapHistoryMessage(
   }
 }
 
+/**
+ * Resolve a Nexconn sender user ID to the Pulse Circle member's full name.
+ *
+ * The Nexconn SDK delivers messages with `senderUserId` in Nexconn format
+ * (UUID hyphens stripped, 32-char hex). Pulse Circle member records store
+ * `userId` as a UUID with hyphens. Convert each member's userId to Nexconn
+ * format and compare to find the matching member.
+ *
+ * Returns null when no member matches (e.g. members not yet loaded, or an
+ * unknown sender). Callers must fall back gracefully — never display a raw
+ * ID as a sender name.
+ */
+function resolveSenderName(
+  senderUserId: string,
+  members: CircleMembership[]
+): string | null {
+  const member = members.find(
+    (m) => toNexconnUserId(m.userId) === senderUserId
+  )
+  return member?.fullName ?? null
+}
+
 export function MessagesPage() {
   const { user: currentUser } = useAuth()
   const [view, setView] = React.useState<'list' | 'conversation'>('list')
@@ -179,6 +203,17 @@ export function MessagesPage() {
   const [historyLoadedMap, setHistoryLoadedMap] = React.useState<Record<string, boolean>>({})
   // Ref to the last rendered message element for auto-scroll-to-bottom.
   const messagesEndRef = React.useRef<HTMLDivElement>(null)
+  // Ref mirroring messagesByConversation so appendIncoming can check for
+  // duplicates without taking messagesByConversation as a dependency (which
+  // would cause the Nexconn handler effect to re-subscribe on every message).
+  // Kept in sync via effect below.
+  const messagesByConversationRef = React.useRef(messagesByConversation)
+
+  // Keep the ref in sync with state (assigned in an effect, not during
+  // render, to avoid the "Cannot access refs during render" lint error).
+  React.useEffect(() => {
+    messagesByConversationRef.current = messagesByConversation
+  }, [messagesByConversation])
   // Backend-authorized mapping from Nexconn groupId to Pulse Circle circleId.
   // Populated from GET /api/circles/:circleId/nexconn-channel for each of the
   // authenticated user's circles. Used to route incoming Nexconn messages to
@@ -219,6 +254,20 @@ export function MessagesPage() {
     []
   )
 
+  const [membersExpanded, setMembersExpanded] = React.useState(false)
+  const [connectionExpanded, setConnectionExpanded] = React.useState(false)
+  // Per-circle unread message counts. Keyed by circleId. Initialized from
+  // GET /api/circles and updated in real time as messages arrive / are read.
+  const [unreadCountMap, setUnreadCountMap] = React.useState<Record<string, number>>(
+    {}
+  )
+  // Per-circle timestamp of when the conversation was last marked as read.
+  // Used to determine which messages are "new" (arrived after last read) and
+  // to position the "New messages" divider.
+  const [lastReadAtMap, setLastReadAtMap] = React.useState<Record<string, string>>(
+    {}
+  )
+
   // Fetch the authenticated user's real circles. Only fires once a user is
   // resolved; a failed fetch must not break the demonstration conversations.
   React.useEffect(() => {
@@ -234,6 +283,11 @@ export function MessagesPage() {
         if (!cancelled) {
           setCircles(data.circles)
           setCirclesError(null)
+          const nextUnread: Record<string, number> = {}
+          for (const c of data.circles) {
+            nextUnread[c.id] = c.unreadCount ?? 0
+          }
+          setUnreadCountMap(nextUnread)
         }
       } catch {
         if (!cancelled) {
@@ -474,6 +528,39 @@ export function MessagesPage() {
   }, [selectedId, currentMessageCount])
   // AuthContext owns connect/disconnect; this page only subscribes to
   // connection state and registers its message handler.
+  // Mark the conversation as read: resets the unread count and records the
+  // read timestamp. Called when the user opens a conversation.
+  const markAsRead = async (circleId: string): Promise<void> => {
+    try {
+      await api.post(`/api/circles/${circleId}/read`)
+      setUnreadCountMap((prev) => ({ ...prev, [circleId]: 0 }))
+      setLastReadAtMap((prev) => ({
+        ...prev,
+        [circleId]: new Date().toISOString(),
+      }))
+    } catch {
+      // Ignore read failures — local state remains as-is.
+    }
+  }
+
+  // Increment the unread count for a circle. Called when a new incoming
+  // message arrives via Nexconn. Never counts the current user's own messages
+  // (mapIncomingMessage only returns RECEIVE-direction messages).
+  const incrementUnread = React.useCallback(
+    async (circleId: string): Promise<void> => {
+      try {
+        await api.post(`/api/circles/${circleId}/messages/unread`)
+        setUnreadCountMap((prev) => ({
+          ...prev,
+          [circleId]: (prev[circleId] ?? 0) + 1,
+        }))
+      } catch {
+        // Ignore increment failures — local state remains as-is.
+      }
+    },
+    []
+  )
+
   const appendIncoming = React.useCallback(
     (message: Message): void => {
       const chatMessage = mapIncomingMessage(message)
@@ -482,8 +569,6 @@ export function MessagesPage() {
       if (!channelId) return
 
       // Route incoming messages to real circle conversations only.
-      // Real channel IDs are backend-authorized Nexconn groupIds mapped to
-      // circleIds via channelIdToCircleId. Unknown channels are dropped.
       let targetId: string | null = null
       if (channelIdToCircleId[channelId]) {
         targetId = channelIdToCircleId[channelId]
@@ -491,11 +576,15 @@ export function MessagesPage() {
         return
       }
 
+      // Prevent duplicate unread counts from repeated events or history
+      // reloads. Check using the ref (synchronous, no stale closure).
+      const currentMessages = messagesByConversationRef.current[targetId] ?? []
+      if (currentMessages.some((entry) => entry.id === chatMessage.id)) {
+        return
+      }
+
       setMessagesByConversation((current) => {
         const existing = current[targetId] ?? []
-        if (existing.some((entry) => entry.id === chatMessage.id)) {
-          return current
-        }
         const merged = [...existing, chatMessage]
         merged.sort((a, b) => a.sentAt < b.sentAt ? -1 : a.sentAt > b.sentAt ? 1 : 0)
         return {
@@ -503,8 +592,11 @@ export function MessagesPage() {
           [targetId]: merged,
         }
       })
+
+      // Increment unread count for new incoming messages from other users.
+      void incrementUnread(targetId)
     },
-    [channelIdToCircleId]
+    [channelIdToCircleId, incrementUnread]
   )
 
   // Nexconn message-handler lifecycle. The subscription callback fires
@@ -546,13 +638,20 @@ export function MessagesPage() {
   const selectedConversation =
     selectedCircle ? { title: selectedCircle.name, subtitle: circleSubtitle(selectedCircle) } : null
   const messages = selectedId ? messagesByConversation[selectedId] ?? [] : []
+  // Database-backed members for the selected circle, used to resolve Nexconn
+  // sender IDs to real full names. May be empty while loading.
+  const members = selectedId ? circleMembersMap[selectedId] ?? [] : []
 
   // Derived recipient state for the currently selected real circle. These
   // are computed in render (never inside an effect) so the effect never has
   // to call setState synchronously.
-  const selectConversation = (id: string) => {
+  const selectConversation = async (id: string): Promise<void> => {
     setSelectedId(id)
     setView('conversation')
+    // Mark the conversation as read when the user opens it. This clears the
+    // unread badge and records the read timestamp so newly arriving messages
+    // after this point are correctly flagged as "new."
+    await markAsRead(id)
   }
 
   const goBack = () => {
@@ -817,6 +916,7 @@ export function MessagesPage() {
         createdAt: data.circle.createdAt,
         updatedAt: data.circle.updatedAt,
         role: data.membership.role,
+        unreadCount: 0,
       }
 
       setCircles((current) => {
@@ -901,12 +1001,28 @@ export function MessagesPage() {
     }
   }
   return (
-    <section aria-labelledby="messages-heading" className="space-y-5">
-      <h2 id="messages-heading" className="text-2xl font-semibold tracking-tight">
-        Messages
-      </h2>
+    <section
+      aria-labelledby="messages-heading"
+      className={cn(
+        isMobile && view === 'conversation'
+          ? 'flex flex-col min-h-svh gap-0'
+          : 'space-y-5'
+      )}
+    >
+      {!isMobile || view === 'list' ? (
+        <h2 id="messages-heading" className="text-2xl font-semibold tracking-tight">
+          Messages
+        </h2>
+      ) : null}
 
-      <div className="flex flex-col gap-5 lg:flex-row lg:gap-5 min-h-[600px]">
+      <div
+        className={cn(
+          'flex flex-col gap-5 lg:flex-row lg:gap-5',
+          isMobile && view === 'conversation'
+            ? 'flex-1 min-h-0'
+            : 'min-h-[600px]'
+        )}
+      >
         {/* Left: Circle sidebar */}
         {!isMobile || view === 'list' ? (
           <div className="flex flex-col gap-4 min-w-[280px] lg:w-[360px]">
@@ -992,9 +1108,13 @@ export function MessagesPage() {
                             </span>
                           </p>
                         </div>
-                        <span className="text-[10px] font-semibold text-ink-muted">
-                          Real
-                        </span>
+                        {unreadCountMap[circle.id] > 0 ? (
+                          <span
+                            className="text-[10px] font-semibold text-white bg-pulse-700 rounded-full px-2 py-0.5 shrink-0"
+                          >
+                            {unreadCountMap[circle.id] >= 4 ? '4+ new' : `${unreadCountMap[circle.id]} new`}
+                          </span>
+                        ) : null}
                       </button>
                     )
                   })}
@@ -1071,166 +1191,308 @@ export function MessagesPage() {
           <div className="flex-1 flex flex-col min-w-0">
             {/* Conversation header */}
             <Card className="flex flex-col h-full">
-              <div className="border-b border-line px-5 py-4 sm:px-6 flex flex-row items-center justify-between gap-3">
-                <div className="flex items-center gap-3">
+              {isMobile ? (
+                <div className="border-b border-line bg-surface px-4 py-3 flex items-center justify-between shrink-0">
                   <button
                     onClick={goBack}
-                    className="lg:hidden shrink-0 inline-flex min-h-10 items-center gap-2 rounded-lg px-3 text-sm font-semibold text-pulse-800 hover:bg-pulse-50"
+                    className="shrink-0 inline-flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-semibold text-pulse-800 hover:bg-pulse-50"
                   >
                     <ArrowLeft aria-hidden="true" className="size-4" />
                     Back
                   </button>
-                  <div className="relative shrink-0">
-                    <Avatar name={selectedCircle!.name} tone="pulse" size="md" />
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <h2 className="text-lg font-semibold tracking-tight truncate">
-                      {selectedConversation.title}
-                    </h2>
-                    <div className="flex items-center gap-1.5 mt-0.5">
-                      <span className="text-[11px] font-semibold text-ink-muted">
+                  <div className="flex items-center gap-2 min-w-0 flex-1">
+                    <div className="relative shrink-0">
+                      <Avatar name={selectedCircle!.name} tone="pulse" size="sm" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <h3 className="font-semibold truncate text-sm">
+                        {selectedConversation.title}
+                      </h3>
+                      <p className="text-[10px] text-ink-muted truncate">
                         {circleMembersMap[selectedId]?.length ?? 0} members
-                      </span>
-                      {selectedIsRealCircle && selectedCircle &&
-                        (selectedCircle.role === 'ELDER' ||
-                          selectedCircle.role === 'ADMIN') && (
-                          <button
-                            onClick={() => {
-                              setRenameName(selectedCircle.name)
-                              setRenameDescription(selectedCircle.description ?? '')
-                              setRenameError(null)
-                              setRenameOpen(true)
-                            }}
-                            className="flex items-center gap-1 min-h-8 rounded-lg px-2 py-1 text-[11px] font-semibold text-pulse-800 hover:bg-pulse-50"
-                          >
-                            Edit
-                          </button>
-                        )}
-                    </div>
-                    <p className="text-[11px] text-ink-muted truncate">
-                      {selectedConversation.subtitle}
-                    </p>
-                  </div>
-                </div>
-              </div>
-
-              {/* Circle management panel (compact, collapsible sections) */}
-              {selectedIsRealCircle ? (
-                <div className="border-b border-line bg-surface/50 px-5 py-3 sm:px-6">
-                  <div className="grid gap-2 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3">
-                    <div className="rounded-xl border border-line bg-surface px-3 py-3">
-                      <p className="text-[11px] font-semibold text-ink-muted mb-2">
-                        Members
                       </p>
-                      <ul className="space-y-1">
-                        {(circleMembersMap[selectedId] ?? []).map((member) => (
-                          <li
-                            key={member.userId}
-                            className="flex items-center justify-between px-2 py-1.5 rounded-lg hover:bg-pulse-50/50"
-                          >
-                            <div className="flex items-center gap-2 min-w-0">
-                              <span className="truncate text-sm text-ink">
-                                {member.fullName}
-                              </span>
-                            </div>
-                            <span className="text-[10px] font-semibold text-ink-muted">
-                              {member.role === 'ELDER'
-                                ? 'Elder'
-                                : member.role === 'NEIGHBOR'
-                                  ? 'Neighbour'
-                                  : member.role === 'FAMILY'
-                                    ? 'Family'
-                                    : member.role}
-                            </span>
-                          </li>
-                        ))}
-                        {(circleMembersMap[selectedId] ?? []).length === 0 && (
-                          <li className="px-2 py-1.5 text-[11px] text-ink-muted">
-                            Loading members…
-                          </li>
-                        )}
-                      </ul>
                     </div>
-
-                    {selectedCircle &&
+                  </div>
+                  {selectedIsRealCircle && selectedCircle &&
                     (selectedCircle.role === 'ELDER' ||
-                      selectedCircle.role === 'ADMIN') ? (
-                      <div className="rounded-xl border border-line bg-surface px-3 py-3">
-                        <p className="text-[11px] font-semibold text-ink-muted mb-2">
-                          Invite member
-                        </p>
-                        <form
-                          onSubmit={handleInviteSubmit}
-                          className="flex flex-col gap-2"
-                        >
-                          <input
-                            value={inviteEmail}
-                            onChange={(event) => setInviteEmail(event.target.value)}
-                            placeholder="Email address"
-                            type="email"
-                            autoComplete="email"
-                            disabled={isInviting}
-                            className="min-h-10 rounded-lg border border-line bg-surface px-3 py-2 text-sm focus:border-pulse-700 focus:ring-2 focus:ring-pulse-700 disabled:opacity-50 disabled:cursor-not-allowed"
-                          />
-                          <Button
-                            type="submit"
-                            size="sm"
-                            disabled={isInviting || !inviteEmail.trim()}
-                            className="w-full min-h-10"
-                          >
-                            {isInviting ? 'Inviting…' : 'Invite'}
-                          </Button>
-                          {inviteError && (
-                            <p className="mt-1 text-[11px] text-danger">
-                              {inviteError}
-                            </p>
-                          )}
-                          {inviteSuccess && (
-                            <p className="mt-1 text-[11px] text-success">
-                              Invitation sent. The recipient can accept via their email link.
-                            </p>
-                          )}
-                        </form>
-                      </div>
-                    ) : null}
-
-                    <div className="rounded-xl border border-line bg-surface px-3 py-3">
-                      <p className="text-[11px] font-semibold text-ink-muted mb-2">
-                        Chat connection
-                      </p>
-                      <Button
-                        onClick={handleSyncMember}
-                        size="sm"
-                        disabled={isSyncingMember}
-                        className="w-full min-h-10 text-[11px]"
+                      selectedCircle.role === 'ADMIN') && (
+                      <button
+                        onClick={() => {
+                          setRenameName(selectedCircle.name)
+                          setRenameDescription(selectedCircle.description ?? '')
+                          setRenameError(null)
+                          setRenameOpen(true)
+                        }}
+                        className="shrink-0 rounded-lg px-2 py-1 text-[10px] font-semibold text-pulse-800 hover:bg-pulse-50"
                       >
-                        {isSyncingMember
-                          ? 'Syncing…'
-                          : syncMemberSuccess === 'added'
-                            ? 'Synced'
-                            : syncMemberSuccess === 'already-member'
-                              ? 'Already synced'
-                              : 'Recover membership'}
-                      </Button>
-                      {syncMemberError && (
-                        <p className="mt-1 text-[11px] text-danger">
-                          {syncMemberError}
-                        </p>
-                      )}
+                        Edit
+                      </button>
+                    )}
+                </div>
+              ) : (
+                <div className="border-b border-line px-5 py-4 sm:px-6 flex flex-row items-center justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    <button
+                      onClick={goBack}
+                      className="lg:hidden shrink-0 inline-flex min-h-10 items-center gap-2 rounded-lg px-3 text-sm font-semibold text-pulse-800 hover:bg-pulse-50"
+                    >
+                      <ArrowLeft aria-hidden="true" className="size-4" />
+                      Back
+                    </button>
+                    <div className="relative shrink-0">
+                      <Avatar name={selectedCircle!.name} tone="pulse" size="md" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <h2 className="text-lg font-semibold tracking-tight truncate">
+                        {selectedConversation.title}
+                      </h2>
+                      <div className="flex items-center gap-1.5 mt-0.5">
+                        <span className="text-[11px] font-semibold text-ink-muted">
+                          {circleMembersMap[selectedId]?.length ?? 0} members
+                        </span>
+                        {selectedIsRealCircle && selectedCircle &&
+                          (selectedCircle.role === 'ELDER' ||
+                            selectedCircle.role === 'ADMIN') && (
+                              <button
+                                onClick={() => {
+                                  setRenameName(selectedCircle.name)
+                                  setRenameDescription(selectedCircle.description ?? '')
+                                  setRenameError(null)
+                                  setRenameOpen(true)
+                                }}
+                                className="flex items-center gap-1 min-h-8 rounded-lg px-2 py-1 text-[11px] font-semibold text-pulse-800 hover:bg-pulse-50"
+                              >
+                                Edit
+                              </button>
+                            )}
+                      </div>
+                      <p className="text-[11px] text-ink-muted truncate">
+                        {selectedConversation.subtitle}
+                      </p>
                     </div>
                   </div>
                 </div>
+              )}
+
+              {/* Circle management panel (collapsible on mobile) */}
+              {selectedIsRealCircle ? (
+                <>
+                  {isMobile ? (
+                    <>
+                      {/* Members - collapsible */}
+                      <div className="border-b border-line bg-surface px-4 py-2 shrink-0">
+                        <button
+                          onClick={() => setMembersExpanded((prev) => !prev)}
+                          className="w-full flex items-center justify-between text-[11px] font-semibold text-ink-muted"
+                        >
+                          <span>
+                            Members{' '}
+                            <span className="font-normal text-ink">
+                              ({circleMembersMap[selectedId]?.length ?? 0})
+                            </span>
+                          </span>
+                          {membersExpanded ? (
+                            <ChevronUp className="size-4" aria-hidden="true" />
+                          ) : (
+                            <ChevronDown className="size-4" aria-hidden="true" />
+                          )}
+                        </button>
+                        {membersExpanded && (
+                          <ul className="mt-2 space-y-1">
+                            {(circleMembersMap[selectedId] ?? []).map((member) => (
+                              <li
+                                key={member.userId}
+                                className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-lg hover:bg-pulse-50/50"
+                              >
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <span className="truncate text-sm text-ink">
+                                    {member.fullName}
+                                  </span>
+                                </div>
+                                <span className="text-[10px] font-semibold text-ink-muted">
+                                  {member.role === 'ELDER'
+                                    ? 'Elder'
+                                    : member.role === 'NEIGHBOR'
+                                      ? 'Neighbour'
+                                      : member.role === 'FAMILY'
+                                        ? 'Family'
+                                        : member.role}
+                                </span>
+                              </li>
+                            ))}
+                            {(circleMembersMap[selectedId] ?? []).length === 0 && (
+                              <li className="px-2 py-1.5 text-[10px] text-ink-muted">
+                                No members loaded
+                              </li>
+                            )}
+                          </ul>
+                        )}
+                      </div>
+
+                      {/* Chat connection - collapsible */}
+                      <div className="border-b border-line bg-surface px-4 py-2 shrink-0">
+                        <button
+                          onClick={() => setConnectionExpanded((prev) => !prev)}
+                          className="w-full flex items-center justify-between text-[11px] font-semibold text-ink-muted"
+                        >
+                          <span>Chat connection</span>
+                          {connectionExpanded ? (
+                            <ChevronUp className="size-4" aria-hidden="true" />
+                          ) : (
+                            <ChevronDown className="size-4" aria-hidden="true" />
+                          )}
+                        </button>
+                        {connectionExpanded && (
+                          <div className="mt-2">
+                            <Button
+                              onClick={handleSyncMember}
+                              size="sm"
+                              disabled={isSyncingMember}
+                              className="w-full min-h-9 text-[10px] px-3"
+                            >
+                              {isSyncingMember
+                                ? 'Syncing…'
+                                : syncMemberSuccess === 'added'
+                                  ? 'Synced'
+                                  : syncMemberSuccess === 'already-member'
+                                    ? 'Already synced'
+                                    : 'Recover membership'}
+                            </Button>
+                            {syncMemberError && (
+                              <p className="mt-1 text-[10px] text-danger">
+                                {syncMemberError}
+                              </p>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    </>
+                  ) : (
+                    <div className="border-b border-line bg-surface/50 px-5 py-3 sm:px-6">
+                      <div className="grid gap-2 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3">
+                        <div className="rounded-xl border border-line bg-surface px-3 py-3">
+                          <p className="text-[11px] font-semibold text-ink-muted mb-2">
+                            Members
+                          </p>
+                          <ul className="space-y-1">
+                            {(circleMembersMap[selectedId] ?? []).map((member) => (
+                              <li
+                                key={member.userId}
+                                className="flex items-center justify-between px-2 py-1.5 rounded-lg hover:bg-pulse-50/50"
+                              >
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <span className="truncate text-sm text-ink">
+                                    {member.fullName}
+                                  </span>
+                                </div>
+                                <span className="text-[10px] font-semibold text-ink-muted">
+                                  {member.role === 'ELDER'
+                                    ? 'Elder'
+                                    : member.role === 'NEIGHBOR'
+                                      ? 'Neighbour'
+                                      : member.role === 'FAMILY'
+                                        ? 'Family'
+                                        : member.role}
+                                </span>
+                              </li>
+                            ))}
+                            {(circleMembersMap[selectedId] ?? []).length === 0 && (
+                              <li className="px-2 py-1.5 text-[11px] text-ink-muted">
+                                Loading members…
+                              </li>
+                            )}
+                          </ul>
+                        </div>
+
+                        {selectedCircle &&
+                        (selectedCircle.role === 'ELDER' ||
+                          selectedCircle.role === 'ADMIN') ? (
+                          <div className="rounded-xl border border-line bg-surface px-3 py-3">
+                            <p className="text-[11px] font-semibold text-ink-muted mb-2">
+                              Invite member
+                            </p>
+                            <form
+                              onSubmit={handleInviteSubmit}
+                              className="flex flex-col gap-2"
+                            >
+                              <input
+                                value={inviteEmail}
+                                onChange={(event) => setInviteEmail(event.target.value)}
+                                placeholder="Email address"
+                                type="email"
+                                autoComplete="email"
+                                disabled={isInviting}
+                                className="min-h-10 rounded-lg border border-line bg-surface px-3 py-2 text-sm focus:border-pulse-700 focus:ring-2 focus:ring-pulse-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                              />
+                              <Button
+                                type="submit"
+                                size="sm"
+                                disabled={isInviting || !inviteEmail.trim()}
+                                className="w-full min-h-10"
+                              >
+                                {isInviting ? 'Inviting…' : 'Invite'}
+                              </Button>
+                              {inviteError && (
+                                <p className="mt-1 text-[11px] text-danger">
+                                  {inviteError}
+                                </p>
+                              )}
+                              {inviteSuccess && (
+                                <p className="mt-1 text-[11px] text-success">
+                                  Invitation sent. The recipient can accept via their email link.
+                                </p>
+                              )}
+                            </form>
+                          </div>
+                        ) : null}
+
+                        <div className="rounded-xl border border-line bg-surface px-3 py-3">
+                          <p className="text-[11px] font-semibold text-ink-muted mb-2">
+                            Chat connection
+                          </p>
+                          <Button
+                            onClick={handleSyncMember}
+                            size="sm"
+                            disabled={isSyncingMember}
+                            className="w-full min-h-10 text-[11px]"
+                          >
+                            {isSyncingMember
+                              ? 'Syncing…'
+                              : syncMemberSuccess === 'added'
+                                ? 'Synced'
+                                : syncMemberSuccess === 'already-member'
+                                  ? 'Already synced'
+                                  : 'Recover membership'}
+                          </Button>
+                          {syncMemberError && (
+                            <p className="mt-1 text-[11px] text-danger">
+                              {syncMemberError}
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </>
               ) : null}
 
               {/* Message history area */}
-              <div className="flex-1 overflow-y-auto p-4 space-y-4 sm:p-6 lg:p-8">
+              <div
+                className={cn(
+                  'flex-1 overflow-y-auto space-y-3',
+                  isMobile ? 'p-3' : 'p-4 sm:p-6 lg:p-8'
+                )}
+              >
                 {messages.length === 0 ? (
                   <div className="flex flex-col items-center justify-center h-full text-center">
                     <MessageSquareText
-                      className="size-16 text-line mb-4"
+                      className={cn(
+                        'size-12 text-line mb-3',
+                        isMobile ? 'size-12 mb-3' : 'size-16 mb-4'
+                      )}
                       aria-hidden="true"
                     />
-                    <h3 className="text-lg font-semibold text-ink">
+                    <h3 className="text-base font-semibold text-ink">
                       No messages yet
                     </h3>
                     <p className="mt-1 text-sm text-ink-muted max-w-xs mx-auto">
@@ -1248,41 +1510,126 @@ export function MessagesPage() {
                   </div>
                 ) : (
                   <>
-                    {messages.map((message, index) => (
-                      <div
-                        key={message.id}
-                        ref={index === messages.length - 1 ? messagesEndRef : undefined}
-                        className={cn(
-                          'flex flex-col max-w-[85%]',
-                          message.direction === 'outgoing' ? 'ml-auto' : 'mr-auto',
-                        )}
-                      >
-                        {message.direction === 'incoming' && (
-                          <p className="text-[11px] font-semibold text-ink-muted mb-1">
-                            {message.authorName}
-                          </p>
-                        )}
-                        <div
-                          className={cn(
-                            'rounded-xl px-4 py-2.5 text-sm leading-relaxed',
-                            message.direction === 'outgoing'
-                              ? 'text-white bg-pulse-600 rounded-tr-none shadow-sm'
-                              : 'text-ink bg-surface-muted rounded-tl-none',
-                          )}
-                        >
-                          <p>{message.body}</p>
-                          <p className="mt-1 text-[10px] opacity-60">
-                            {formatClock(message.sentAt)}
-                          </p>
-                        </div>
-                      </div>
-                    ))}
+                      {messages.map((message, index) => {
+                        const prevMessage = messages[index - 1]
+                        const showSenderName =
+                          !prevMessage || prevMessage.authorId !== message.authorId
+
+                        // A message is "new" (unread) when it is incoming and
+                        // arrived after the conversation was last marked as read.
+                        const lastReadAt = lastReadAtMap[selectedId ?? '']
+                        const isUnread =
+                          message.direction === 'incoming' &&
+                          !!lastReadAt &&
+                          message.sentAt > lastReadAt
+                        const prevIsUnread = prevMessage
+                          ? prevMessage.direction === 'incoming' &&
+                            !!lastReadAt &&
+                            prevMessage.sentAt > lastReadAt
+                          : false
+                        const showDivider = isUnread && !prevIsUnread
+
+                        // Resolve the sender's real full name from member data.
+                        // Never display raw Nexconn IDs or fallback identifiers.
+                        let senderDisplayName: string
+                        let senderAvatarName: string
+                        if (message.direction === 'outgoing') {
+                          senderDisplayName = 'You'
+                          senderAvatarName = currentUser?.fullName ?? 'You'
+                        } else {
+                          const resolved = resolveSenderName(
+                            message.authorId,
+                            members
+                          )
+                          senderDisplayName = resolved ?? 'Unknown member'
+                          senderAvatarName = resolved ?? 'Unknown member'
+                        }
+
+                        return (
+                          <React.Fragment key={message.id}>
+                            {showDivider && (
+                              <div
+                                className="w-full flex justify-center my-3"
+                              >
+                                <span
+                                  className="text-[10px] font-semibold text-ink-muted bg-surface/50 px-2 py-0.5 rounded-full border border-line"
+                                >
+                                  New messages
+                                </span>
+                              </div>
+                            )}
+                            <div
+                              ref={
+                                index === messages.length - 1
+                                  ? messagesEndRef
+                                  : undefined
+                              }
+                              className={cn(
+                                'flex gap-2 max-w-[90%]',
+                                message.direction === 'outgoing'
+                                  ? 'justify-end'
+                                  : 'justify-start',
+                              )}
+                            >
+                            {message.direction === 'incoming' && (
+                              <>
+                                <Avatar
+                                  name={senderAvatarName}
+                                  size="sm"
+                                />
+                                <div className="flex flex-col">
+                                  {showSenderName && (
+                                    <p className="text-[10px] font-semibold text-ink-muted mb-0.5">
+                                      {senderDisplayName}
+                                    </p>
+                                  )}
+                                  <div
+                                    className="rounded-xl px-3 py-2 text-sm leading-relaxed bg-surface-muted text-ink rounded-tl-none"
+                                  >
+                                    <p>{message.body}</p>
+                                    <p className="mt-1 text-[10px] opacity-60">
+                                      {formatClock(message.sentAt)}
+                                    </p>
+                                  </div>
+                                </div>
+                              </>
+                            )}
+                            {message.direction === 'outgoing' && (
+                              <>
+                                <div className="flex flex-col items-end">
+                                  {showSenderName && (
+                                    <p className="text-[10px] font-semibold text-ink-muted mb-0.5 text-right">
+                                      {senderDisplayName}
+                                    </p>
+                                  )}
+                                  <div
+                                    className="rounded-xl px-3 py-2 text-sm leading-relaxed text-white bg-pulse-600 rounded-tr-none shadow-sm"
+                                  >
+                                    <p>{message.body}</p>
+                                    <p className="mt-1 text-[10px] opacity-80">
+                                      {formatClock(message.sentAt)}
+                                    </p>
+                                  </div>
+                                </div>
+                                <Avatar
+                                  name={senderAvatarName}
+                                  size="sm"
+                                />
+                              </>
+                            )}
+                          </div>
+                          </React.Fragment>
+                        )
+                      })}
                   </>
                 )}
               </div>
 
               {sendError && (
-                <div className="mb-3 p-3 rounded-lg border border-line bg-danger-soft text-danger text-[11px] px-5">
+                <div className={cn(
+                  'mb-2 rounded-lg border border-line bg-danger-soft text-danger px-5',
+                  isMobile ? 'py-2 text-[10px] mx-3' : 'p-3 text-[11px]'
+                )}>
                   {sendError}
                 </div>
               )}
@@ -1290,7 +1637,12 @@ export function MessagesPage() {
               {/* Message composer */}
               <form
                 onSubmit={handleSend}
-                className="border-t border-line p-4 sm:px-6"
+                className={cn(
+                  'border-t border-line bg-surface shrink-0',
+                  isMobile
+                    ? 'px-4 py-3 pb-[max(1rem,env(safe-area-inset-bottom))]'
+                    : 'p-4 sm:px-6'
+                )}
               >
                 <div className="flex gap-2">
                   <input
@@ -1298,21 +1650,28 @@ export function MessagesPage() {
                     onChange={(event) => setDraft(event.target.value)}
                     placeholder="Type a message…"
                     disabled={sending}
-                    className="flex-1 min-h-12 rounded-xl border border-line bg-surface px-4 py-3 text-base focus:border-pulse-700 focus:ring-2 focus:ring-pulse-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                    className={cn(
+                      'flex-1 rounded-lg border border-line bg-surface px-3 py-2 text-sm focus:border-pulse-700 focus:ring-2 focus:ring-pulse-700 disabled:opacity-50 disabled:cursor-not-allowed',
+                      isMobile ? 'min-h-10' : 'min-h-12',
+                    )}
                   />
                   <Button
                     type="submit"
-                    size="lg"
+                    size={isMobile ? 'sm' : 'lg'}
                     disabled={sending || !draft.trim()}
-                    className="min-h-12 rounded-xl px-6 text-base font-bold text-white bg-pulse-700 hover:bg-pulse-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    className={cn(
+                      'rounded-lg text-white bg-pulse-700 hover:bg-pulse-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed',
+                      isMobile ? 'min-h-10 px-3 text-sm font-bold' : 'min-h-12 rounded-xl px-6 text-base font-bold',
+                    )}
                   >
                     Send
-                    <MessageSquareText aria-hidden="true" className="ml-2 size-4" />
                   </Button>
                 </div>
-                <p className="mt-2 text-[11px] text-ink-muted">
-                  Sent via Nexconn. Incoming messages will appear here as they arrive.
-                </p>
+                {!isMobile && (
+                  <p className="mt-2 text-[11px] text-ink-muted">
+                    Sent via Nexconn. Incoming messages will appear here as they arrive.
+                  </p>
+                )}
               </form>
             </Card>
           </div>
