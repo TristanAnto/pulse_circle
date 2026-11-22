@@ -22,9 +22,9 @@ import { paths } from '@/routes/paths'
 const howItWorks = [
   {
     icon: ClipboardCheck,
-    title: 'One daily check-in',
+    title: 'Daily check-in',
     description:
-      'A single, large button confirms the day has started. No forms, no passwords to remember.',
+      'A simple way to record that you are doing alright each day.',
   },
   {
     icon: Users,

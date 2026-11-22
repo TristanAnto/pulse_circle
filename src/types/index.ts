@@ -11,6 +11,8 @@ export type CircleMember = {
   relationship: string
   presence: MemberPresence
   avatarTone: AvatarTone
+  checkedInToday: boolean
+  checkedInAt: string | null
 }
 
 export type CheckInState = 'completed' | 'due' | 'overdue'

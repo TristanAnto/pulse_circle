@@ -58,6 +58,8 @@ export const circleMembers: CircleMember[] = [
     relationship: 'Neighbour · sample contact',
     presence: 'available',
     avatarTone: 'pulse',
+    checkedInToday: false,
+    checkedInAt: null,
   },
   {
     id: 'member-2',
@@ -66,6 +68,8 @@ export const circleMembers: CircleMember[] = [
     relationship: 'Neighbour · sample contact',
     presence: 'available',
     avatarTone: 'mint',
+    checkedInToday: false,
+    checkedInAt: null,
   },
   {
     id: 'member-3',
@@ -74,6 +78,8 @@ export const circleMembers: CircleMember[] = [
     relationship: 'Family · sample contact',
     presence: 'available',
     avatarTone: 'amber',
+    checkedInToday: false,
+    checkedInAt: null,
   },
 ]
 

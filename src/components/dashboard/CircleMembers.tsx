@@ -45,30 +45,46 @@ export function CircleMembers({ members }: CircleMembersProps) {
                 {member.relationship}
               </p>
             </div>
-            <div className="text-right">
-              <span className="block text-xs font-semibold uppercase tracking-wide text-ink-muted">
-                {roleLabels[member.role]}
-              </span>
-              <span
-                className={cn(
-                  'mt-1 inline-flex items-center gap-1.5 text-sm font-semibold',
-                  member.presence === 'available'
-                    ? 'text-pulse-800'
-                    : 'text-ink-muted',
-                )}
-              >
+              <div className="text-right">
+                <span className="block text-xs font-semibold uppercase tracking-wide text-ink-muted">
+                  {roleLabels[member.role]}
+                </span>
                 <span
-                  aria-hidden="true"
                   className={cn(
-                    'size-2 rounded-full',
+                    'mt-1 inline-flex items-center gap-1.5 text-sm font-semibold',
                     member.presence === 'available'
-                      ? 'bg-pulse-600'
-                      : 'bg-line',
+                      ? 'text-pulse-800'
+                      : 'text-ink-muted',
                   )}
-                />
-                {member.presence === 'available' ? 'Available' : 'Resting'}
-              </span>
-            </div>
+                >
+                  <span
+                    aria-hidden="true"
+                    className={cn(
+                      'size-2 rounded-full',
+                      member.presence === 'available'
+                        ? 'bg-pulse-600'
+                        : 'bg-line',
+                    )}
+                  />
+                  {member.presence === 'available' ? 'Available' : 'Resting'}
+                </span>
+                <span
+                  className="mt-1.5 inline-flex items-center gap-1.5 text-[10px] font-semibold"
+                >
+                  <span
+                    aria-hidden="true"
+                    className={cn(
+                      'size-2 rounded-full',
+                      member.checkedInToday
+                        ? 'bg-pulse-600'
+                        : 'bg-danger-500',
+                    )}
+                  />
+                  {member.checkedInToday
+                    ? 'Checked in today'
+                    : 'Not checked in today'}
+                </span>
+              </div>
           </li>
         ))}
       </ul>

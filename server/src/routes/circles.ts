@@ -22,7 +22,7 @@ import {
   assertCircleNexconnSyncLeaseHeld,
   releaseCircleNexconnSyncLease,
 } from '../lib/circleNexconnSyncLease'
-import { InvitationStatus, MemberRole, Prisma } from '@prisma/client'
+import { CheckInStatus, InvitationStatus, MemberRole, Prisma } from '@prisma/client'
 import { generateInvitationToken, hashInvitationToken } from '../lib/invitation'
 import { sendInvitationEmail } from '../lib/email'
 
@@ -62,6 +62,8 @@ const acceptInvitationSchema = z.object({
 const sendNexconnMessageSchema = z.object({
   text: z.string().trim().min(1).max(2000),
 })
+
+const checkInSchema = z.object({})
 
 
 type CircleResponse = {
@@ -106,6 +108,8 @@ type CircleMemberResponse = {
   fullName: string
   role: MemberRole
   joinedAt: Date
+  checkedInToday: boolean
+  checkedInAt: Date | null
 }
 
 /**
@@ -149,6 +153,14 @@ type NexconnRecipientResponse = {
   nexconnUserId: string
   fullName: string
   role: MemberRole
+}
+
+type CheckInResponse = {
+  id: string
+  userId: string
+  circleId: string
+  status: CheckInStatus
+  checkedInAt: Date | null
 }
 
 /**
@@ -449,6 +461,116 @@ router.post(
 )
 
 /**
+ * POST /api/circles/:circleId/check-in
+ * Records a daily check-in for the authenticated user in the specified circle.
+ *
+ * Requires authentication and active circle membership. Prevents duplicate
+ * check-ins for the same user, circle, and calendar day by checking for an
+ * existing COMPLETED record before creating one (no unique constraint exists
+ * on userId + circleId + calendar day in the schema).
+ */
+router.post(
+  '/:circleId/check-in',
+  authenticate,
+  csrfProtection,
+  membershipRequired('circleId'),
+  async (
+    req: CircleMembershipRequest,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> => {
+    if (!req.user || !req.circleMembership) {
+      res.status(401).json({ error: 'Authentication required' })
+      return
+    }
+
+    const circleId = req.circleMembership.circleId
+    const userId = req.user.userId
+
+    try {
+      const result = checkInSchema.safeParse(req.body)
+      if (!result.success) {
+        res.status(400).json({ error: 'Invalid input' })
+        return
+      }
+
+      // Compute the server's calendar day boundaries for duplicate detection.
+      const now = new Date()
+      const startOfDay = new Date(now)
+      startOfDay.setHours(0, 0, 0, 0)
+      const endOfDay = new Date(now)
+      endOfDay.setHours(23, 59, 59, 999)
+
+      // Duplicate prevention: no unique constraint exists on
+      // (userId, circleId, calendar day), so enforce it in application code.
+      const existing = await prisma.checkIn.findFirst({
+        where: {
+          userId,
+          circleId,
+          status: CheckInStatus.COMPLETED,
+          checkedInAt: {
+            gte: startOfDay,
+            lt: endOfDay,
+          },
+        },
+        select: {
+          id: true,
+          checkedInAt: true,
+          status: true,
+        },
+      })
+
+      if (existing) {
+        res.json({
+          success: true,
+          alreadyCheckedIn: true,
+          checkIn: {
+            id: existing.id,
+            userId,
+            circleId,
+            status: existing.status,
+            checkedInAt: existing.checkedInAt,
+          },
+        })
+        return
+      }
+
+      const checkIn = await prisma.checkIn.create({
+        data: {
+          userId,
+          circleId,
+          status: CheckInStatus.COMPLETED,
+          checkedInAt: now,
+        },
+        select: {
+          id: true,
+          userId: true,
+          circleId: true,
+          status: true,
+          checkedInAt: true,
+        },
+      })
+
+      const response: CheckInResponse = {
+        id: checkIn.id,
+        userId: checkIn.userId,
+        circleId: checkIn.circleId,
+        status: checkIn.status,
+        checkedInAt: checkIn.checkedInAt,
+      }
+
+      res.status(201).json({
+        success: true,
+        alreadyCheckedIn: false,
+        checkIn: response,
+      })
+    } catch (err) {
+      next(err)
+    }
+  }
+)
+
+/**
  * PATCH /api/circles/:circleId
  * Renames a circle. Only ELDER or ADMIN members may rename.
  */
@@ -529,27 +651,64 @@ router.get(
     const circleId = req.circleMembership.circleId
 
     try {
-      const members = await prisma.circleMember.findMany({
-        where: { circleId },
-        select: {
-          userId: true,
-          role: true,
-          joinedAt: true,
-          user: {
-            select: {
-              fullName: true,
+      // Compute calendar day boundaries consistent with the check-in write
+      // endpoint (server local time, start-of-day to end-of-day).
+      const now = new Date()
+      const startOfDay = new Date(now)
+      startOfDay.setHours(0, 0, 0, 0)
+      const endOfDay = new Date(now)
+      endOfDay.setHours(23, 59, 59, 999)
+
+      // Fetch all members and today's completed check-ins in parallel
+      // (single query each, no N+1).
+      const [members, todayCheckIns] = await Promise.all([
+        prisma.circleMember.findMany({
+          where: { circleId },
+          select: {
+            userId: true,
+            role: true,
+            joinedAt: true,
+            user: {
+              select: {
+                fullName: true,
+              },
             },
           },
-        },
-        orderBy: { joinedAt: 'asc' },
-      })
+          orderBy: { joinedAt: 'asc' },
+        }),
+        prisma.checkIn.findMany({
+          where: {
+            circleId,
+            status: CheckInStatus.COMPLETED,
+            checkedInAt: {
+              gte: startOfDay,
+              lt: endOfDay,
+            },
+          },
+          select: {
+            userId: true,
+            checkedInAt: true,
+          },
+        }),
+      ])
 
-      const response: CircleMemberResponse[] = members.map((m) => ({
-        userId: m.userId,
-        fullName: m.user.fullName,
-        role: m.role,
-        joinedAt: m.joinedAt,
-      }))
+      // Index today's check-ins by userId for O(1) lookup per member.
+      const checkInMap = new Map<string, Date>()
+      for (const ci of todayCheckIns) {
+        checkInMap.set(ci.userId, ci.checkedInAt ?? new Date(0))
+      }
+
+      const response: CircleMemberResponse[] = members.map((m) => {
+        const checkedInAt = checkInMap.get(m.userId) ?? null
+        return {
+          userId: m.userId,
+          fullName: m.user.fullName,
+          role: m.role,
+          joinedAt: m.joinedAt,
+          checkedInToday: checkedInAt !== null,
+          checkedInAt,
+        }
+      })
 
       res.json({ members: response })
     } catch (err) {
